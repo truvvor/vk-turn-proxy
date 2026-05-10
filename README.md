@@ -73,33 +73,72 @@ curl -L -o server https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 # Запуск сервера
 ./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
 ```
-#### Установка демона
-На сервере в файле `/etc/systemd/system/vk-turn-proxy.service`
-```
-[Unit]
-Description=VK Turn Proxy Service
-After=network.target
+#### Установка демона (systemd) через self-hosted runner
 
-[Service]
-Type=simple
-ExecStart=/opt/vk-turn-proxy/server-linux-amd64 -listen 0.0.0.0:56000 -connect 127.0.0.1:<wg_port>
-KillMode=process
-Restart=always
-RestartSec=5
-User=nobody
-Group=nogroup
-StandardOutput=append:/var/log/vk-turn-proxy/vk-turn-proxy.log
-StandardError=append:/var/log/vk-turn-proxy/vk-turn-proxy_error.log
-SyslogIdentifier=vk-turn-proxy
+В репозитории лежит всё необходимое:
 
-[Install]
-WantedBy=multi-user.target
+- `deploy/vk-turn-proxy@.service` — параметризованный systemd-юнит (`@udp`, `@vless`), `Restart=always`, sandbox, логи в journal
+- `deploy/{udp,vless}.env.example` — конфиги инстансов с разными `LISTEN`-портами (по умолчанию `56000/udp` и `56001/udp`, не пересекаются с WireGuard `51820` и стандартными портами Xray)
+- `deploy/sudoers.example` — узкие NOPASSWD-правила для пользователя runner-а
+- `scripts/runner-install.sh` — регистрация self-hosted runner-а на сервере
+- `scripts/install.sh` — первичная разметка `/opt/vk-turn-proxy` и `/etc/vk-turn-proxy` (с проверкой, что выбранные UDP-порты свободны — не перекроет ни xray, ни wireguard)
+- `scripts/deploy.sh` — атомарная подмена бинаря и рестарт активных инстансов
+- `.github/workflows/deploy.yml` — workflow на `[self-hosted, linux, x64]`
+
+##### Первый запуск (если runner уже зарегистрирован)
+
+На сервере, как root:
+
+```bash
+# 1. Клонируем репо
+sudo git clone https://github.com/truvvor/vk-turn-proxy.git /opt/src/vk-turn-proxy
+cd /opt/src/vk-turn-proxy
+
+# 2. Раскладываем юнит + env-файл с готовым CONNECT и enable инстанса.
+#    UDP_CONNECT — локальный порт wireguard (или другой UDP backend),
+#    VLESS_CONNECT — локальный порт xray.
+sudo UDP_CONNECT=127.0.0.1:51820 \
+     VLESS_CONNECT=127.0.0.1:8443 \
+     ./scripts/install.sh
+
+# 3. Разрешаем runner-у узкий sudo (имя пользователя runner-а — обычно
+#    'github-runner', 'actions-runner' или владелец процесса Runner.Listener)
+RUNNER_USER=$(ps -o user= -p "$(pgrep -f Runner.Listener | head -1)")
+sudo install -m 0440 -o root -g root \
+    deploy/sudoers.example /etc/sudoers.d/vk-turn-proxy-runner
+sudo sed -i "s/github-runner/${RUNNER_USER}/g" /etc/sudoers.d/vk-turn-proxy-runner
+sudo visudo -cf /etc/sudoers.d/vk-turn-proxy-runner
 ```
-Где `/opt/vk-turn-proxy/server-linux-amd64` - путь к файлу, `<wg_port>` - порт сервера wg
+
+> Если runner ещё не зарегистрирован — можно использовать
+> `scripts/runner-install.sh` (см. комментарии в файле).
+
+##### Деплой
+
+GitHub → **Actions → Deploy → Run workflow** (можно с любой ветки). Workflow
+соберёт `server` под `linux/amd64`, вызовет `scripts/deploy.sh`, рестартует
+все включённые инстансы и упадёт, если `systemctl is-active` не зелёный.
+
+Дальше — на каждый push в `main` (в `server/`, `tcputil/`, `go.mod`, `go.sum`,
+`deploy/`, `scripts/`, `.github/workflows/deploy.yml`) workflow запускается
+автоматически.
+
+##### Подключение клиента
+
+Сервер слушает `0.0.0.0:<LISTEN_PORT>/udp`. Откройте этот порт в файрволе/SG,
+затем на клиенте:
+
+```bash
+./client -listen 127.0.0.1:9000 \
+         -peer <публичный_ip_сервера>:<LISTEN_PORT> \
+         -vk-link https://vk.com/call/join/...
 ```
-systemctl daemon-reload
-systemctl enable vk-turn-proxy.service
-systemctl start vk-turn-proxy.service
+
+##### Проверка и логи
+
+```bash
+systemctl status 'vk-turn-proxy@*'
+journalctl -u 'vk-turn-proxy@udp' -f
 ```
 #### Docker
 

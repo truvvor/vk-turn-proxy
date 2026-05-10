@@ -1,0 +1,38 @@
+[Unit]
+Description=VK TURN Proxy (%i)
+Documentation=https://github.com/cacggghp/vk-turn-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vk-turn-proxy/%i.env
+ExecStart=/opt/vk-turn-proxy/server -listen ${LISTEN} -connect ${CONNECT} $EXTRA_ARGS
+
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
