@@ -1,0 +1,99 @@
+name: Setup WireGuard
+# Runs on the self-hosted runner. Installs WireGuard server-side, generates
+# keys (idempotent), enables wg-quick@wg0, then assembles the client config
+# and uploads it as a 7-day artifact. The client config contains the client
+# private key — do NOT commit it to git.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      listen_port:
+        description: WireGuard UDP listen port
+        required: false
+        default: '51820'
+      subnet:
+        description: WireGuard subnet (CIDR)
+        required: false
+        default: '10.13.13.0/24'
+
+jobs:
+  setup-wireguard:
+    name: Install + configure wg-quick@wg0
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Run setup-wireguard.sh
+        env:
+          LISTEN_PORT: ${{ inputs.listen_port }}
+          SUBNET: ${{ inputs.subnet }}
+        run: sudo -n -E bash ./scripts/setup-wireguard.sh
+
+      - name: Assemble client config (wg-client.conf)
+        env:
+          LISTEN_PORT: ${{ inputs.listen_port }}
+        run: |
+          set -e
+          PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org \
+                       || curl -fsS --max-time 3 https://ifconfig.me \
+                       || echo '<server-ip>')"
+          CLIENT_PRIV=$(sudo cat /etc/wireguard/client_private.key)
+          SERVER_PUB=$(sudo cat /etc/wireguard/server_public.key)
+          # Read CLIENT_IP from wg0.conf so we stay consistent if it ever changes
+          CLIENT_IP=$(sudo awk '/^\[Peer\]/{p=1} p && /^AllowedIPs/{print $3; exit}' /etc/wireguard/wg0.conf)
+          : "${CLIENT_IP:=10.13.13.2/32}"
+          umask 077
+          cat > wg-client.conf <<EOF
+          [Interface]
+          Address = ${CLIENT_IP}
+          PrivateKey = ${CLIENT_PRIV}
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = ${SERVER_PUB}
+          Endpoint = ${PUBLIC_IP}:${LISTEN_PORT}
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = 25
+          EOF
+          # Indented heredoc above keeps file readable; strip leading spaces.
+          sed -i 's/^          //' wg-client.conf
+          chmod 0600 wg-client.conf
+          echo "wg-client.conf size: $(wc -c < wg-client.conf) bytes"
+
+      - name: Upload wg-client.conf artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wg-client-config
+          path: wg-client.conf
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Cleanup workspace
+        if: always()
+        run: rm -f wg-client.conf
+
+      - name: Summary
+        env:
+          LISTEN_PORT: ${{ inputs.listen_port }}
+          SUBNET: ${{ inputs.subnet }}
+        run: |
+          PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org || echo '<server-ip>')"
+          SERVER_PUB=$(sudo cat /etc/wireguard/server_public.key)
+          {
+            echo "## WireGuard server is up"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Endpoint | \`${PUBLIC_IP}:${LISTEN_PORT}/udp\` |"
+            echo "| Subnet | \`${SUBNET}\` |"
+            echo "| Server pubkey | \`${SERVER_PUB}\` |"
+            echo ""
+            echo "### Next steps"
+            echo "1. Download the **wg-client-config** artifact from this run for \`wg-client.conf\` (contains the client private key)."
+            echo "2. Open UDP/${LISTEN_PORT} in the cloud firewall / security group."
+            echo "3. Run **Deploy** workflow once more — bootstrap will detect WireGuard and add a \`vk-turn-proxy@udp\` instance."
+          } >> "$GITHUB_STEP_SUMMARY"
