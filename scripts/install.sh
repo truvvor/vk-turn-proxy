@@ -19,10 +19,27 @@ install -d -m 0750 "$CONFIG_DIR"
 
 install -m 0644 "$REPO_DIR/deploy/vk-turn-proxy@.service" "$UNIT_PATH"
 
+# Refuse to seed an env file whose default LISTEN port is already taken by
+# something else on this host (xray, wireguard, etc.). This protects the
+# operator from clobbering an unrelated service on first install.
+port_owner() {
+    local port="$1"
+    ss -ulnH "sport = :$port" 2>/dev/null | awk 'NR==1{print $0}'
+}
+
 for instance in udp vless; do
     target="$CONFIG_DIR/$instance.env"
     if [ ! -e "$target" ]; then
-        install -m 0640 "$REPO_DIR/deploy/$instance.env.example" "$target"
+        example="$REPO_DIR/deploy/$instance.env.example"
+        listen=$(awk -F= '/^LISTEN=/{print $2; exit}' "$example")
+        port="${listen##*:}"
+        if owner=$(port_owner "$port") && [ -n "$owner" ]; then
+            echo "Skipping $target: UDP port $port already in use:" >&2
+            echo "    $owner" >&2
+            echo "    Edit $example or set a different LISTEN port before re-running." >&2
+            continue
+        fi
+        install -m 0640 "$example" "$target"
         echo "Created $target — edit CONNECT before enabling the instance."
     else
         echo "$target already exists, leaving as-is."
