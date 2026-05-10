@@ -73,34 +73,85 @@ curl -L -o server https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 # Запуск сервера
 ./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
 ```
-#### Установка демона
-На сервере в файле `/etc/systemd/system/vk-turn-proxy.service`
-```
-[Unit]
-Description=VK Turn Proxy Service
-After=network.target
+#### Установка демона (systemd)
 
-[Service]
-Type=simple
-ExecStart=/opt/vk-turn-proxy/server-linux-amd64 -listen 0.0.0.0:56000 -connect 127.0.0.1:<wg_port>
-KillMode=process
-Restart=always
-RestartSec=5
-User=nobody
-Group=nogroup
-StandardOutput=append:/var/log/vk-turn-proxy/vk-turn-proxy.log
-StandardError=append:/var/log/vk-turn-proxy/vk-turn-proxy_error.log
-SyslogIdentifier=vk-turn-proxy
+В репозитории есть готовый параметризованный systemd-юнит `vk-turn-proxy@.service`,
+два примера конфигов (`udp`, `vless`), скрипт первичной установки и CI workflow
+для self-hosted GitHub Actions runner. Они позволяют поднять прокси один раз и
+автоматически обновлять бинарник при пушах в `main`.
 
-[Install]
-WantedBy=multi-user.target
+##### 1. Первичная установка на сервере
+
+Один раз на сервере:
+
+```bash
+git clone https://github.com/cacggghp/vk-turn-proxy.git
+cd vk-turn-proxy
+sudo ./scripts/install.sh
 ```
-Где `/opt/vk-turn-proxy/server-linux-amd64` - путь к файлу, `<wg_port>` - порт сервера wg
+
+Скрипт создаст:
+
+- `/opt/vk-turn-proxy/` — каталог для бинарника
+- `/etc/vk-turn-proxy/{udp,vless}.env` — конфиги инстансов (если их ещё нет)
+- `/etc/systemd/system/vk-turn-proxy@.service` — шаблон юнита
+
+Отредактируйте нужный конфиг и укажите `CONNECT`:
+
+```bash
+sudoedit /etc/vk-turn-proxy/udp.env
+# LISTEN=0.0.0.0:56000
+# CONNECT=127.0.0.1:51820   # порт WireGuard
+# EXTRA_ARGS=
 ```
-systemctl daemon-reload
-systemctl enable vk-turn-proxy.service
-systemctl start vk-turn-proxy.service
+
+Положите бинарник (или дождитесь первого деплоя через runner — см. ниже):
+
+```bash
+curl -L -o /tmp/server https://github.com/cacggghp/vk-turn-proxy/releases/latest/download/server-linux-amd64
+sudo install -m 0755 /tmp/server /opt/vk-turn-proxy/server
 ```
+
+Включите и запустите нужный инстанс (или оба):
+
+```bash
+sudo systemctl enable --now vk-turn-proxy@udp.service
+sudo systemctl enable --now vk-turn-proxy@vless.service
+```
+
+Проверка:
+
+```bash
+systemctl status 'vk-turn-proxy@*'
+journalctl -u 'vk-turn-proxy@udp' -f
+```
+
+Юнит настроен на `Restart=always`, без лимита перезапусков
+(`StartLimitIntervalSec=0`), с sandbox-ом (`DynamicUser`, `ProtectSystem=strict`,
+`NoNewPrivileges` и т.д.) и логированием в journal.
+
+##### 2. Автоматический деплой через self-hosted runner
+
+Workflow `.github/workflows/deploy.yml` собирает `server` под `linux/amd64` и
+вызывает `scripts/deploy.sh`, который атомарно подменяет бинарник и
+перезапускает все включённые инстансы. Триггеры: push в `main` (в `server/`,
+`tcputil/`, `go.mod`, `go.sum`, `deploy/`, `scripts/`) и ручной
+`workflow_dispatch`.
+
+Один раз на сервере:
+
+1. Поднимите [self-hosted GitHub Actions runner](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners)
+   с лейблами `self-hosted, linux, x64`.
+2. Дайте пользователю runner-а ограниченный sudo (используйте шаблон):
+   ```bash
+   sudo install -m 0440 -o root -g root \
+       deploy/sudoers.example /etc/sudoers.d/vk-turn-proxy-runner
+   sudoedit /etc/sudoers.d/vk-turn-proxy-runner   # замените 'github-runner' на логин runner-а
+   sudo visudo -cf /etc/sudoers.d/vk-turn-proxy-runner
+   ```
+3. Дальше — пушите в `main` или жмите «Run workflow». Бинарник пересобирается,
+   подменяется атомарно, инстансы рестартуют, workflow проверяет, что
+   `systemctl is-active` зелёный.
 #### Docker
 
 Образ Docker публикуется в GitHub Container Registry:
