@@ -58,14 +58,36 @@ for candidate in /usr/local/etc/xray/config.json /etc/xray/config.json; do
 done
 if [ -n "$XRAY_CONFIG" ]; then
     if command -v jq >/dev/null 2>&1; then
-        XRAY_PORT="$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)"
-        XRAY_SOURCE="$XRAY_CONFIG (jq)"
+        # Pick the most likely user-facing VLESS inbound, in priority order:
+        # 1. vless on 443 (typical Reality / TLS production setup)
+        # 2. any vless inbound
+        # 3. any inbound on 443
+        # 4. first inbound in the file (last-resort guess)
+        for sel in \
+            '.inbounds[]? | select(.protocol=="vless" and .port==443) | .port' \
+            '.inbounds[]? | select(.protocol=="vless") | .port' \
+            '.inbounds[]? | select(.port==443) | .port' \
+            '.inbounds[0]?.port'; do
+            cand="$(jq -r "($sel) // empty" "$XRAY_CONFIG" 2>/dev/null | head -1)"
+            if [ -n "$cand" ] && [ "$cand" != "null" ]; then
+                XRAY_PORT="$cand"
+                XRAY_SOURCE="$XRAY_CONFIG (jq: $sel)"
+                break
+            fi
+        done
     else
         XRAY_PORT="$(grep -oE '"port"\s*:\s*[0-9]+' "$XRAY_CONFIG" \
                      | head -1 | grep -oE '[0-9]+')" || true
         XRAY_SOURCE="$XRAY_CONFIG (grep)"
     fi
 fi
+
+# Explicit override via env wins over autodetection.
+if [ -n "${XRAY_PORT_OVERRIDE:-}" ]; then
+    XRAY_PORT="$XRAY_PORT_OVERRIDE"
+    XRAY_SOURCE="env XRAY_PORT_OVERRIDE"
+fi
+
 if systemctl is-active --quiet xray 2>/dev/null; then
     XRAY_ACTIVE=yes
 else
@@ -113,20 +135,57 @@ say "Public IP:    ${PUBLIC_IP}"
 
 hr; say "Plan"; hr
 
-UDP_CONNECT="127.0.0.1:${WG_PORT:-51820}"
-say "  install.sh will create:"
-say "    /etc/vk-turn-proxy/udp.env    LISTEN=0.0.0.0:${PROXY_PORT}  CONNECT=${UDP_CONNECT}"
+INSTALL_ENV=()
+PROXY_UDP_PORT=""
+PROXY_VLESS_PORT=""
+
+if [ -n "$WG_PORT" ]; then
+    PROXY_UDP_PORT="$PROXY_PORT"
+    INSTALL_ENV+=(UDP_CONNECT="127.0.0.1:${WG_PORT}" UDP_LISTEN="0.0.0.0:${PROXY_UDP_PORT}")
+    say "  vk-turn-proxy@udp:    LISTEN 0.0.0.0:${PROXY_UDP_PORT}  CONNECT 127.0.0.1:${WG_PORT}"
+else
+    say "  vk-turn-proxy@udp:    SKIPPED (WireGuard not detected on this host)"
+fi
+
 if [ -n "$XRAY_PORT" ]; then
-    say "    /etc/vk-turn-proxy/vless.env  LISTEN=0.0.0.0:$((PROXY_PORT + 1))  CONNECT=127.0.0.1:${XRAY_PORT}"
+    if [ -n "$PROXY_UDP_PORT" ]; then
+        PROXY_VLESS_PORT=$((PROXY_UDP_PORT + 1))
+    else
+        PROXY_VLESS_PORT="$PROXY_PORT"
+    fi
+    INSTALL_ENV+=(VLESS_CONNECT="127.0.0.1:${XRAY_PORT}" VLESS_LISTEN="0.0.0.0:${PROXY_VLESS_PORT}")
+    say "  vk-turn-proxy@vless:  LISTEN 0.0.0.0:${PROXY_VLESS_PORT}  CONNECT 127.0.0.1:${XRAY_PORT}"
+else
+    say "  vk-turn-proxy@vless:  SKIPPED (Xray not detected on this host)"
 fi
-say "  systemctl will:"
-say "    daemon-reload, enable vk-turn-proxy@udp.service${XRAY_PORT:+, enable vk-turn-proxy@vless.service}"
+
+if [ "${#INSTALL_ENV[@]}" -eq 0 ]; then
+    say ""
+    say "ERROR: neither WireGuard nor Xray detected. Nothing to do." >&2
+    exit 1
+fi
+
+# Sudoers: only install our narrow rule when the runner DOESN'T already have
+# broader sudo coverage. If sudo -n -l already shows (ALL) NOPASSWD: ALL or a
+# pre-existing NOPASSWD on the commands deploy.sh needs, leave it alone.
+WANT_SUDOERS=1
 if [ -n "$RUNNER_USER" ]; then
-    say "  sudoers will be installed at /etc/sudoers.d/vk-turn-proxy-runner for user '${RUNNER_USER}'"
+    if sudo -n -l -U "$RUNNER_USER" 2>/dev/null | grep -qE 'NOPASSWD:\s*ALL'; then
+        WANT_SUDOERS=0
+        say "  sudoers:              SKIPPED (user '${RUNNER_USER}' already has NOPASSWD ALL)"
+    else
+        say "  sudoers:              install /etc/sudoers.d/vk-turn-proxy-runner for '${RUNNER_USER}'"
+    fi
+else
+    WANT_SUDOERS=0
+    say "  sudoers:              SKIPPED (Runner.Listener process not found)"
 fi
+
+say ""
 say "  Existing wireguard / xray configurations will NOT be touched."
 say ""
-say "  Connection URL after deploy:  ${PUBLIC_IP}:${PROXY_PORT}/udp"
+[ -n "$PROXY_UDP_PORT" ]   && say "  WireGuard URL:  ${PUBLIC_IP}:${PROXY_UDP_PORT}/udp"
+[ -n "$PROXY_VLESS_PORT" ] && say "  VLESS URL:      ${PUBLIC_IP}:${PROXY_VLESS_PORT}/udp"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     hr; say "Dry-run: nothing changed."; hr
@@ -135,13 +194,9 @@ fi
 
 hr; say "Applying"; hr
 
-INSTALL_ENV=(UDP_CONNECT="$UDP_CONNECT" UDP_LISTEN="0.0.0.0:${PROXY_PORT}")
-if [ -n "$XRAY_PORT" ]; then
-    INSTALL_ENV+=(VLESS_CONNECT="127.0.0.1:${XRAY_PORT}" VLESS_LISTEN="0.0.0.0:$((PROXY_PORT + 1))")
-fi
 env "${INSTALL_ENV[@]}" "$REPO_DIR/scripts/install.sh"
 
-if [ -n "$RUNNER_USER" ]; then
+if [ "$WANT_SUDOERS" -eq 1 ]; then
     SUDOERS=/etc/sudoers.d/vk-turn-proxy-runner
     install -m 0440 -o root -g root "$REPO_DIR/deploy/sudoers.example" "$SUDOERS"
     sed -i "s/github-runner/${RUNNER_USER}/g" "$SUDOERS"
@@ -156,10 +211,9 @@ fi
 hr
 say "Bootstrap complete."
 say ""
-say "Next:"
-say "  1. GitHub → Actions → Deploy → Run workflow"
-say "     (use ref 'claude/setup-daemon-deployment-e19Al' until merged)"
-say "  2. Open UDP/${PROXY_PORT} in your firewall / cloud security group."
+say "Next:  GitHub → Actions → Deploy → Run workflow."
+say "       Open the LISTEN port(s) in the cloud firewall / security group."
 say ""
-say "Connection URL:  ${PUBLIC_IP}:${PROXY_PORT}/udp"
+[ -n "$PROXY_UDP_PORT" ]   && say "WireGuard URL:  ${PUBLIC_IP}:${PROXY_UDP_PORT}/udp"
+[ -n "$PROXY_VLESS_PORT" ] && say "VLESS URL:      ${PUBLIC_IP}:${PROXY_VLESS_PORT}/udp"
 hr

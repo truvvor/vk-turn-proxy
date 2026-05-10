@@ -41,6 +41,13 @@ jobs:
           go-version: '1.25.5'
           cache: true
 
+      - name: Bootstrap host (idempotent)
+        # First-time setup: detect WireGuard / Xray, write env files,
+        # enable systemd units. After the initial run install.sh leaves
+        # existing /etc/vk-turn-proxy/*.env files alone, so this becomes
+        # a no-op on subsequent deploys.
+        run: sudo -n bash ./scripts/bootstrap.sh
+
       - name: Build server binary
         run: |
           mkdir -p dist
@@ -59,18 +66,38 @@ jobs:
           found=0
           for instance in udp vless; do
             unit="vk-turn-proxy@${instance}.service"
-            if sudo /bin/systemctl is-enabled "$unit" >/dev/null 2>&1; then
+            if sudo systemctl is-enabled "$unit" >/dev/null 2>&1; then
               found=$((found + 1))
               echo "::group::status $unit"
-              sudo /bin/systemctl --no-pager --lines=30 status "$unit" || true
+              sudo systemctl --no-pager --lines=30 status "$unit" || true
               echo "::endgroup::"
-              if ! sudo /bin/systemctl is-active "$unit" >/dev/null 2>&1; then
+              if ! sudo systemctl is-active "$unit" >/dev/null 2>&1; then
                 echo "::error::$unit is not active after deploy"
                 fail=1
               fi
             fi
           done
           if [ "$found" -eq 0 ]; then
-            echo "::warning::No enabled vk-turn-proxy@* instance found on this host."
+            echo "::error::No enabled vk-turn-proxy@* instance found on this host."
+            fail=1
           fi
           exit "$fail"
+
+      - name: Print connection URL
+        if: success()
+        run: |
+          PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo '<server-ip>')"
+          {
+            echo "## Active vk-turn-proxy endpoints"
+            echo ""
+            for instance in udp vless; do
+              unit="vk-turn-proxy@${instance}.service"
+              env_file="/etc/vk-turn-proxy/${instance}.env"
+              if sudo systemctl is-active "$unit" >/dev/null 2>&1 && sudo test -r "$env_file"; then
+                listen=$(sudo grep '^LISTEN=' "$env_file" | cut -d= -f2)
+                connect=$(sudo grep '^CONNECT=' "$env_file" | cut -d= -f2)
+                port="${listen##*:}"
+                echo "- **${instance}**: \`${PUBLIC_IP}:${port}\` (proxies to \`${connect}\`)"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
