@@ -1,8 +1,8 @@
 name: Inventory
-# Runs on the self-hosted runner and prints a read-only snapshot of the host:
-# wireguard / xray presence and ports, listening UDP/TCP, runner user, public
-# IP. Use this to verify what the bootstrap script will detect before running
-# any installation.
+# Runs on the self-hosted runner and writes a read-only snapshot of the host
+# (wireguard / xray presence and ports, listening UDP/TCP, runner user, sudo
+# capabilities, public IP, bootstrap dry-run) into _inventory/latest.md and
+# commits it back to the branch so the result is readable from the repo.
 
 permissions:
   contents: write
@@ -18,9 +18,14 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
 
-      - name: Detect (no sudo)
+      - name: Collect inventory into _inventory/latest.md
+        shell: bash
         run: |
           set +e
+          mkdir -p _inventory
+          OUT=_inventory/latest.md
+          : > "$OUT"
+
           {
             echo "## Inventory ($(hostname), $(date -u +%FT%TZ))"
             echo ""
@@ -32,19 +37,19 @@ jobs:
 
             echo "### Listening UDP sockets"
             echo '```'
-            ss -uln 2>/dev/null
+            ss -uln 2>&1
             echo '```'
 
             echo "### Listening TCP sockets (top 30)"
             echo '```'
-            ss -tln 2>/dev/null | head -30
+            ss -tln 2>&1 | head -30
             echo '```'
 
             echo "### WireGuard"
             if ls /etc/wireguard/ >/dev/null 2>&1; then
-              echo "/etc/wireguard exists, contents:"
+              echo "/etc/wireguard contents:"
               echo '```'
-              ls -la /etc/wireguard/ 2>/dev/null
+              ls -la /etc/wireguard/ 2>&1
               echo '```'
             else
               echo "/etc/wireguard not readable (or missing) without sudo."
@@ -55,7 +60,7 @@ jobs:
               wg show 2>&1
               echo '```'
             else
-              echo "wg binary not found in PATH."
+              echo "wg binary not in PATH."
             fi
             echo "WireGuard interfaces (ip link):"
             echo '```'
@@ -65,9 +70,9 @@ jobs:
             echo "### Xray"
             for p in /usr/local/etc/xray /etc/xray; do
               if [ -d "$p" ]; then
-                echo "$p exists:"
+                echo "$p contents:"
                 echo '```'
-                ls -la "$p" 2>/dev/null
+                ls -la "$p" 2>&1
                 echo '```'
               fi
             done
@@ -87,45 +92,45 @@ jobs:
             echo '```'
             curl -fsS --max-time 3 https://api.ipify.org 2>&1; echo
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Sudo probe
-        run: |
-          set +e
-          echo "## Sudo capabilities" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "Allowed without password (sudo -n -l):" >> "$GITHUB_STEP_SUMMARY"
-          sudo -n -l 2>&1 >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "WireGuard config readable via sudo:" >> "$GITHUB_STEP_SUMMARY"
-          sudo -n bash -c 'grep -hE "^\s*ListenPort" /etc/wireguard/*.conf 2>&1 | head -5' >> "$GITHUB_STEP_SUMMARY" 2>&1
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "wg show via sudo:" >> "$GITHUB_STEP_SUMMARY"
-          sudo -n wg show 2>&1 | head -30 >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "### Sudo capabilities (sudo -n -l)"
+            echo '```'
+            sudo -n -l 2>&1
+            echo '```'
 
-      - name: Bootstrap dry-run
-        run: |
-          set +e
-          echo "## bootstrap.sh --dry-run" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          sudo -n bash ./scripts/bootstrap.sh --dry-run 2>&1 >> "$GITHUB_STEP_SUMMARY"
-          rc=$?
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "(exit $rc — non-zero means sudo is too narrow; run bootstrap.sh manually as root once)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "### Sudo: read WireGuard ListenPort"
+            echo '```'
+            sudo -n bash -c 'grep -hE "^\s*ListenPort" /etc/wireguard/*.conf 2>&1 | head -5' 2>&1
+            echo '```'
 
-      - name: Persist inventory to _inventory/latest.md
+            echo "### Sudo: wg show"
+            echo '```'
+            sudo -n wg show 2>&1 | head -30
+            echo '```'
+
+            echo "### bootstrap.sh --dry-run (via sudo -n)"
+            echo '```'
+            sudo -n bash ./scripts/bootstrap.sh --dry-run 2>&1
+            rc=$?
+            echo ""
+            echo "(bootstrap.sh --dry-run exit: $rc)"
+            echo '```'
+          } >> "$OUT"
+
+          # Mirror to the per-step UI summary too.
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Wrote $(wc -c < "$OUT") bytes to $OUT"
+
+      - name: Commit and push _inventory/latest.md
+        shell: bash
         run: |
           set -e
-          mkdir -p _inventory
-          # Copy the step summary into a tracked file so it can be read later.
-          cp "$GITHUB_STEP_SUMMARY" _inventory/latest.md
           git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
           git add _inventory/latest.md
           if git diff --cached --quiet; then
-            echo "No inventory changes to commit."
+            echo "Inventory unchanged; nothing to commit."
             exit 0
           fi
           git commit -m "inventory: refresh latest.md from runner $(hostname)"
