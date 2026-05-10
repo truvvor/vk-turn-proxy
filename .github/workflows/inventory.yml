@@ -1,0 +1,132 @@
+name: Inventory
+# Runs on the self-hosted runner and prints a read-only snapshot of the host:
+# wireguard / xray presence and ports, listening UDP/TCP, runner user, public
+# IP. Use this to verify what the bootstrap script will detect before running
+# any installation.
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inventory:
+    name: Host inventory
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Detect (no sudo)
+        run: |
+          set +e
+          {
+            echo "## Inventory ($(hostname), $(date -u +%FT%TZ))"
+            echo ""
+            echo "### Runner user"
+            echo '```'
+            id
+            echo "Runner.Listener pid:  $(pgrep -f Runner.Listener | head -1)"
+            echo '```'
+
+            echo "### Listening UDP sockets"
+            echo '```'
+            ss -uln 2>/dev/null
+            echo '```'
+
+            echo "### Listening TCP sockets (top 30)"
+            echo '```'
+            ss -tln 2>/dev/null | head -30
+            echo '```'
+
+            echo "### WireGuard"
+            if ls /etc/wireguard/ >/dev/null 2>&1; then
+              echo "/etc/wireguard exists, contents:"
+              echo '```'
+              ls -la /etc/wireguard/ 2>/dev/null
+              echo '```'
+            else
+              echo "/etc/wireguard not readable (or missing) without sudo."
+            fi
+            if command -v wg >/dev/null 2>&1; then
+              echo "wg show (may need sudo):"
+              echo '```'
+              wg show 2>&1
+              echo '```'
+            else
+              echo "wg binary not found in PATH."
+            fi
+            echo "WireGuard interfaces (ip link):"
+            echo '```'
+            ip -br link show type wireguard 2>&1
+            echo '```'
+
+            echo "### Xray"
+            for p in /usr/local/etc/xray /etc/xray; do
+              if [ -d "$p" ]; then
+                echo "$p exists:"
+                echo '```'
+                ls -la "$p" 2>/dev/null
+                echo '```'
+              fi
+            done
+            echo "systemctl status xray:"
+            echo '```'
+            systemctl status xray --no-pager 2>&1 | head -20
+            echo '```'
+
+            echo "### vk-turn-proxy (existing install, if any)"
+            echo '```'
+            ls -la /opt/vk-turn-proxy/ 2>&1
+            ls -la /etc/vk-turn-proxy/ 2>&1
+            systemctl list-units 'vk-turn-proxy@*' --all --no-legend --no-pager 2>&1
+            echo '```'
+
+            echo "### Public IP"
+            echo '```'
+            curl -fsS --max-time 3 https://api.ipify.org 2>&1; echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sudo probe
+        run: |
+          set +e
+          echo "## Sudo capabilities" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Allowed without password (sudo -n -l):" >> "$GITHUB_STEP_SUMMARY"
+          sudo -n -l 2>&1 >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "WireGuard config readable via sudo:" >> "$GITHUB_STEP_SUMMARY"
+          sudo -n bash -c 'grep -hE "^\s*ListenPort" /etc/wireguard/*.conf 2>&1 | head -5' >> "$GITHUB_STEP_SUMMARY" 2>&1
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "wg show via sudo:" >> "$GITHUB_STEP_SUMMARY"
+          sudo -n wg show 2>&1 | head -30 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bootstrap dry-run
+        run: |
+          set +e
+          echo "## bootstrap.sh --dry-run" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          sudo -n bash ./scripts/bootstrap.sh --dry-run 2>&1 >> "$GITHUB_STEP_SUMMARY"
+          rc=$?
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "(exit $rc — non-zero means sudo is too narrow; run bootstrap.sh manually as root once)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persist inventory to _inventory/latest.md
+        run: |
+          set -e
+          mkdir -p _inventory
+          # Copy the step summary into a tracked file so it can be read later.
+          cp "$GITHUB_STEP_SUMMARY" _inventory/latest.md
+          git config user.email "actions@github.com"
+          git config user.name  "github-actions[bot]"
+          git add _inventory/latest.md
+          if git diff --cached --quiet; then
+            echo "No inventory changes to commit."
+            exit 0
+          fi
+          git commit -m "inventory: refresh latest.md from runner $(hostname)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
