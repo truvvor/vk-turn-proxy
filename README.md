@@ -85,39 +85,33 @@ curl -L -o server https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 - `scripts/deploy.sh` — атомарная подмена бинаря и рестарт активных инстансов
 - `.github/workflows/deploy.yml` — workflow на `[self-hosted, linux, x64]`
 
-##### Первый запуск (один раз)
+##### Первый запуск (если runner уже зарегистрирован)
 
 На сервере, как root:
 
 ```bash
-# 1. Клонируем репо в постоянное место
+# 1. Клонируем репо
 sudo git clone https://github.com/truvvor/vk-turn-proxy.git /opt/src/vk-turn-proxy
 cd /opt/src/vk-turn-proxy
 
-# 2. Регистрируем self-hosted runner.
-#    Токен: GitHub → Settings → Actions → Runners → New self-hosted runner.
-sudo RUNNER_URL=https://github.com/truvvor/vk-turn-proxy \
-     RUNNER_TOKEN=<токен из GitHub> \
-     ./scripts/runner-install.sh
+# 2. Раскладываем юнит + env-файл с готовым CONNECT и enable инстанса.
+#    UDP_CONNECT — локальный порт wireguard (или другой UDP backend),
+#    VLESS_CONNECT — локальный порт xray.
+sudo UDP_CONNECT=127.0.0.1:51820 \
+     VLESS_CONNECT=127.0.0.1:8443 \
+     ./scripts/install.sh
 
-# 3. Раскладываем каталоги, юнит и пример env (порты, занятые xray/wg, пропускаются)
-sudo ./scripts/install.sh
-
-# 4. Указываем CONNECT — порт вашего локального xray или wireguard
-sudoedit /etc/vk-turn-proxy/udp.env       # CONNECT=127.0.0.1:<wg_port>
-# и/или
-sudoedit /etc/vk-turn-proxy/vless.env     # CONNECT=127.0.0.1:<xray_port>
-
-# 5. Разрешаем runner-у дёргать systemd без пароля
+# 3. Разрешаем runner-у узкий sudo (имя пользователя runner-а — обычно
+#    'github-runner', 'actions-runner' или владелец процесса Runner.Listener)
+RUNNER_USER=$(ps -o user= -p "$(pgrep -f Runner.Listener | head -1)")
 sudo install -m 0440 -o root -g root \
     deploy/sudoers.example /etc/sudoers.d/vk-turn-proxy-runner
-sudo sed -i 's/github-runner/<runner_user>/g' /etc/sudoers.d/vk-turn-proxy-runner
+sudo sed -i "s/github-runner/${RUNNER_USER}/g" /etc/sudoers.d/vk-turn-proxy-runner
 sudo visudo -cf /etc/sudoers.d/vk-turn-proxy-runner
-
-# 6. Включаем нужные инстансы
-sudo systemctl enable vk-turn-proxy@udp.service
-sudo systemctl enable vk-turn-proxy@vless.service
 ```
+
+> Если runner ещё не зарегистрирован — можно использовать
+> `scripts/runner-install.sh` (см. комментарии в файле).
 
 ##### Деплой
 
