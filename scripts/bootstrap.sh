@@ -102,7 +102,12 @@ else
 fi
 
 # ---------------- Free LISTEN port for our proxy ----------------
-port_busy() { ss -uln 2>/dev/null | awk 'NR>1{print $5}' | grep -qE "(:|\])${1}$"; }
+# Use ss's `sport` filter directly — parsing columns is fragile because
+# `ss -uln` may right-align addresses and the column count differs across
+# versions. Returns 0 (busy) iff at least one socket binds the port.
+port_busy() {
+    [ -n "$(ss -ulnH "sport = :$1" 2>/dev/null)" ]
+}
 
 PROXY_PORT=""
 for candidate in 56000 56010 56020 56100 56200 57000; do
