@@ -60,10 +60,12 @@ jobs:
         run: ./scripts/deploy.sh dist/server
 
       - name: Verify enabled instances are active
+        id: verify
         run: |
           sleep 3
           fail=0
           found=0
+          failed_units=""
           for instance in udp vless; do
             unit="vk-turn-proxy@${instance}.service"
             if sudo systemctl is-enabled "$unit" >/dev/null 2>&1; then
@@ -73,6 +75,7 @@ jobs:
               echo "::endgroup::"
               if ! sudo systemctl is-active "$unit" >/dev/null 2>&1; then
                 echo "::error::$unit is not active after deploy"
+                failed_units="${failed_units} ${unit}"
                 fail=1
               fi
             fi
@@ -81,7 +84,47 @@ jobs:
             echo "::error::No enabled vk-turn-proxy@* instance found on this host."
             fail=1
           fi
+          # Export for the diagnostics step.
+          echo "failed_units=${failed_units# }" >> "$GITHUB_OUTPUT"
           exit "$fail"
+
+      - name: Diagnostics on verify failure
+        if: failure() && steps.verify.outputs.failed_units != ''
+        run: |
+          set +e
+          for unit in ${{ steps.verify.outputs.failed_units }}; do
+            instance="${unit#vk-turn-proxy@}"; instance="${instance%.service}"
+            env_file="/etc/vk-turn-proxy/${instance}.env"
+
+            echo "::group::journalctl -u $unit (last 80 lines)"
+            sudo journalctl -u "$unit" -n 80 --no-pager
+            echo "::endgroup::"
+
+            echo "::group::env file: $env_file"
+            sudo cat "$env_file" 2>&1
+            echo "::endgroup::"
+
+            echo "::group::systemd-cat: failed exec attempt"
+            sudo systemctl show "$unit" --no-pager \
+                -p ActiveState,SubState,Result,ExecMainStatus,ExecMainCode,LoadState,UnitFileState,Restart
+            echo "::endgroup::"
+          done
+
+          echo "::group::ss -ulnp (all UDP listeners)"
+          sudo ss -ulnp
+          echo "::endgroup::"
+
+          echo "::group::ip link / wg interfaces"
+          ip -br link
+          sudo wg show 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::/opt/vk-turn-proxy"
+          sudo ls -la /opt/vk-turn-proxy/
+          file /opt/vk-turn-proxy/server 2>&1 || true
+          echo "::endgroup::"
+          # Re-fail so the workflow run is still red.
+          exit 1
 
       - name: Print connection URL
         if: success()
