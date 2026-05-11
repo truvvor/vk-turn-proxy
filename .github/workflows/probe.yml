@@ -14,6 +14,10 @@ on:
         description: How far back to look (journalctl --since)
         required: false
         default: '10 minutes ago'
+      tcpdump_seconds:
+        description: tcpdump duration on UDP 51820 / 56010 (0 to skip)
+        required: false
+        default: '0'
 
 jobs:
   probe:
@@ -72,5 +76,28 @@ jobs:
           out '```'
 
           out ""
+          out "### wg show (peer transfer counters)"
+          out '```'
+          sudo wg show 2>&1 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
+
+          out ""
           out "### Public IP"
           out "\`$(curl -fsS --max-time 3 https://api.ipify.org)\`"
+
+      - name: Optional tcpdump
+        if: inputs.tcpdump_seconds != '0' && inputs.tcpdump_seconds != ''
+        env:
+          SECS: ${{ inputs.tcpdump_seconds }}
+        run: |
+          set +e
+          out() { echo "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          out ""
+          out "### tcpdump (UDP 51820 + 56010, ${SECS}s window)"
+          out ""
+          out "Run this workflow, then have the client try to reconnect WHILE this is capturing."
+          out '```'
+          sudo timeout "$SECS" tcpdump -nn -i any \
+              '(udp port 51820 or udp port 56010)' -c 200 2>&1 \
+              | tail -80 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
