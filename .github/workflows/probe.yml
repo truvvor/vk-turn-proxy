@@ -1,0 +1,103 @@
+name: Connection probe
+# Run-on-demand health check. Pulls recent journal entries from
+# vk-turn-proxy@udp and @vless, counts inbound DTLS handshake attempts in
+# the chosen window, and prints them to the step summary so we can tell
+# whether client traffic is reaching the server at all.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      window:
+        description: How far back to look (journalctl --since)
+        required: false
+        default: '10 minutes ago'
+      tcpdump_seconds:
+        description: tcpdump duration on UDP 51820 / 56010 (0 to skip)
+        required: false
+        default: '0'
+
+jobs:
+  probe:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Snapshot journal + listening sockets
+        env:
+          WINDOW: ${{ inputs.window }}
+        run: |
+          set +e
+          out() { echo "$@" >> "$GITHUB_STEP_SUMMARY"; }
+
+          out "## Connection probe ($(date -u +%FT%TZ))"
+          out ""
+          out "Looking back: \`${WINDOW}\`"
+          out ""
+
+          for instance in udp vless; do
+            unit="vk-turn-proxy@${instance}.service"
+
+            out "### ${unit}"
+            out ""
+            out "**State:** $(sudo systemctl is-active "$unit" 2>&1)"
+
+            # `Connection from` is logged by server/main.go on every accepted
+            # DTLS connection. Counting it gives us a clean inbound metric.
+            inbound=$(sudo journalctl -u "$unit" --since "$WINDOW" --no-pager 2>/dev/null \
+                      | grep -c "Connection from")
+            handshakes=$(sudo journalctl -u "$unit" --since "$WINDOW" --no-pager 2>/dev/null \
+                         | grep -c "Handshake done")
+            failed=$(sudo journalctl -u "$unit" --since "$WINDOW" --no-pager 2>/dev/null \
+                     | grep -cE "Handshake failed|Failed: |panic")
+
+            out ""
+            out "| Metric | Count |"
+            out "|---|---|"
+            out "| Incoming DTLS connections | \`${inbound}\` |"
+            out "| Successful handshakes | \`${handshakes}\` |"
+            out "| Errors / failures | \`${failed}\` |"
+            out ""
+
+            out "<details><summary>journalctl -u ${unit} --since '${WINDOW}'</summary>"
+            out ""
+            out '```'
+            sudo journalctl -u "$unit" --since "$WINDOW" --no-pager 2>&1 \
+                | tail -100 >> "$GITHUB_STEP_SUMMARY"
+            out '```'
+            out "</details>"
+            out ""
+          done
+
+          out "### Listening UDP (relevant ports)"
+          out '```'
+          sudo ss -ulnp 2>&1 | grep -E "Process|:5[16][0-9]{3}" \
+              >> "$GITHUB_STEP_SUMMARY"
+          out '```'
+
+          out ""
+          out "### wg show (peer transfer counters)"
+          out '```'
+          sudo wg show 2>&1 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
+
+          out ""
+          out "### Public IP"
+          out "\`$(curl -fsS --max-time 3 https://api.ipify.org)\`"
+
+      - name: Optional tcpdump
+        if: inputs.tcpdump_seconds != '0' && inputs.tcpdump_seconds != ''
+        env:
+          SECS: ${{ inputs.tcpdump_seconds }}
+        run: |
+          set +e
+          out() { echo "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          out ""
+          out "### tcpdump (UDP 51820 + 56010, ${SECS}s window)"
+          out ""
+          out "Run this workflow, then have the client try to reconnect WHILE this is capturing."
+          out '```'
+          sudo timeout "$SECS" tcpdump -nn -i any \
+              '(udp port 51820 or udp port 56010)' -c 200 2>&1 \
+              | tail -80 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
