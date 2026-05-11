@@ -84,6 +84,14 @@ SERVER_PRIV="$(cat server_private.key)"
 CLIENT_PUB="$(cat client_public.key)"
 
 # ---- Server config ----
+# Note on the INPUT DROP rule: with this WireGuard sitting behind
+# vk-turn-proxy@udp, the only legitimate source of WG packets is the proxy
+# on localhost. If UDP/${LISTEN_PORT} is reachable from the public Internet
+# (e.g. because the cloud firewall is open), WG can complete a handshake
+# directly from a client's external IP and then *cache that endpoint* for
+# replies — which silently breaks the proxy path (replies skip the proxy
+# and go to the now-stale public address). Dropping non-loopback packets
+# here makes the proxy the only viable WG transport.
 cat > wg0.conf <<EOF
 [Interface]
 Address = ${SERVER_IP}
@@ -92,9 +100,11 @@ PrivateKey = ${SERVER_PRIV}
 PostUp   = iptables -t nat -A POSTROUTING -s ${SUBNET} -o ${EXT_IF} -j MASQUERADE
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT
 PostUp   = iptables -A FORWARD -o wg0 -j ACCEPT
+PostUp   = iptables -I INPUT 1 -p udp --dport ${LISTEN_PORT} ! -s 127.0.0.0/8 -m comment --comment "wg0-loopback-only" -j DROP
 PostDown = iptables -t nat -D POSTROUTING -s ${SUBNET} -o ${EXT_IF} -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -D INPUT -p udp --dport ${LISTEN_PORT} ! -s 127.0.0.0/8 -m comment --comment "wg0-loopback-only" -j DROP
 
 [Peer]
 # Single client peer
