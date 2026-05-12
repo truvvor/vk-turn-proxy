@@ -97,24 +97,53 @@ cat > wg0.conf <<EOF
 Address = ${SERVER_IP}
 ListenPort = ${LISTEN_PORT}
 PrivateKey = ${SERVER_PRIV}
+# MTU 1280 mirrors the client side (turnbridge ships with MTU 1280 in its
+# wg-quick template). Smaller wg0 MTU avoids: WG transport-data getting
+# wrapped in DTLS+STUN+UDP/IP and exceeding the 1500-byte ens3 MTU, which
+# triggers IP fragmentation on the reply path and silent drops at DPI.
+MTU = 1280
 PostUp   = iptables -t nat -A POSTROUTING -s ${SUBNET} -o ${EXT_IF} -j MASQUERADE
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT
 PostUp   = iptables -A FORWARD -o wg0 -j ACCEPT
 PostUp   = iptables -I INPUT 1 -p udp --dport ${LISTEN_PORT} ! -s 127.0.0.0/8 -m comment --comment "wg0-loopback-only" -j DROP
+# MSS clamping for both directions through wg0. Without this, internal
+# clients advertise an MSS of 1448 (matching ens3 MTU 1500), the reply
+# packets exceed wg0's 1280 MTU, and the kernel has to either fragment
+# (slow, drops counted in IpFragFails) or send ICMP "frag needed"
+# (often filtered by transit ISPs => stalled TCP).
+PostUp   = iptables -t mangle -A FORWARD -o wg0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp   = iptables -t mangle -A FORWARD -i wg0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -t nat -D POSTROUTING -s ${SUBNET} -o ${EXT_IF} -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
 PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
 PostDown = iptables -D INPUT -p udp --dport ${LISTEN_PORT} ! -s 127.0.0.0/8 -m comment --comment "wg0-loopback-only" -j DROP
+PostDown = iptables -t mangle -D FORWARD -o wg0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t mangle -D FORWARD -i wg0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 [Peer]
 # Single client peer
 PublicKey = ${CLIENT_PUB}
 AllowedIPs = ${CLIENT_IP}
+# Match the client-side PersistentKeepalive so the TURN channel
+# binding stays warm even when the user side is idle.
+PersistentKeepalive = 25
 EOF
 chmod 0600 wg0.conf
 
-# ---- IPv4 forwarding ----
-echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-wireguard.conf
+# ---- Kernel tuning ----
+# IPv4 forwarding (always needed) + bigger UDP socket buffers so neither
+# WireGuard nor vk-turn-proxy@udp drops bursts into UdpRcvbufErrors when
+# the wire delivers faster than the userspace proxy can drain. Default
+# rmem_max on Ubuntu cloud images is 208 KiB which overflows trivially
+# on a Hetzner/ovh-class link; 25 MiB matches what wireguard upstream
+# recommends for high-throughput tunnels.
+cat > /etc/sysctl.d/99-wireguard.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 26214400
+net.core.wmem_max = 26214400
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+SYSCTL
 sysctl --system >/dev/null
 
 # ---- Service ----
