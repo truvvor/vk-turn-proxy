@@ -169,6 +169,15 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 				return
 			}
 
+			// App-level keepalive sentinel from turnbridge client:
+			// exactly 4 bytes of 0xFF. WireGuard transport_data is min 32
+			// bytes and its first byte is one of 0x01..0x04, so this
+			// sentinel can never collide with a real WG packet. We drop
+			// it silently so wg-quick@wg0 isn't bothered with junk.
+			if n == 4 && buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF && buf[3] == 0xFF {
+				continue
+			}
+
 			if err1 = serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
