@@ -82,6 +82,20 @@ jobs:
           out '```'
 
           out ""
+          out "### iptables INPUT chain (looking for wg0-loopback-only DROP)"
+          out '```'
+          sudo iptables -L INPUT -n -v --line-numbers 2>&1 \
+              | head -30 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
+
+          out ""
+          out "### wg-quick@wg0 status (last 20 lines)"
+          out '```'
+          sudo systemctl --no-pager --lines=20 status wg-quick@wg0 2>&1 \
+              | head -30 >> "$GITHUB_STEP_SUMMARY"
+          out '```'
+
+          out ""
           out "### Public IP"
           out "\`$(curl -fsS --max-time 3 https://api.ipify.org)\`"
 
