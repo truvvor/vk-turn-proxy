@@ -18,6 +18,15 @@ on:
         description: WireGuard subnet (CIDR)
         required: false
         default: '10.13.13.0/24'
+      client_endpoint:
+        description: |
+          Endpoint to put into wg-client.conf. For use through vk-turn-proxy
+          on iOS/desktop clients that run the TP locally on 127.0.0.1:9000,
+          leave this as 127.0.0.1:9000 so WG hands its packets to the TP
+          instead of trying to reach the public IP directly (which is now
+          firewalled to loopback only).
+        required: false
+        default: '127.0.0.1:9000'
 
 jobs:
   setup-wireguard:
@@ -35,15 +44,11 @@ jobs:
 
       - name: Assemble client config (wg-client.conf)
         env:
-          LISTEN_PORT: ${{ inputs.listen_port }}
+          CLIENT_ENDPOINT: ${{ inputs.client_endpoint }}
         run: |
           set -e
-          PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org \
-                       || curl -fsS --max-time 3 https://ifconfig.me \
-                       || echo '<server-ip>')"
           CLIENT_PRIV=$(sudo cat /etc/wireguard/client_private.key)
           SERVER_PUB=$(sudo cat /etc/wireguard/server_public.key)
-          # Read CLIENT_IP from wg0.conf so we stay consistent if it ever changes
           CLIENT_IP=$(sudo awk '/^\[Peer\]/{p=1} p && /^AllowedIPs/{print $3; exit}' /etc/wireguard/wg0.conf)
           : "${CLIENT_IP:=10.13.13.2/32}"
           umask 077
@@ -55,14 +60,14 @@ jobs:
 
           [Peer]
           PublicKey = ${SERVER_PUB}
-          Endpoint = ${PUBLIC_IP}:${LISTEN_PORT}
+          Endpoint = ${CLIENT_ENDPOINT}
           AllowedIPs = 0.0.0.0/0
           PersistentKeepalive = 25
           EOF
-          # Indented heredoc above keeps file readable; strip leading spaces.
           sed -i 's/^          //' wg-client.conf
           chmod 0600 wg-client.conf
           echo "wg-client.conf size: $(wc -c < wg-client.conf) bytes"
+          echo "Endpoint set to: ${CLIENT_ENDPOINT}"
 
       - name: Upload wg-client.conf artifact
         uses: actions/upload-artifact@v4
@@ -80,6 +85,7 @@ jobs:
         env:
           LISTEN_PORT: ${{ inputs.listen_port }}
           SUBNET: ${{ inputs.subnet }}
+          CLIENT_ENDPOINT: ${{ inputs.client_endpoint }}
         run: |
           PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org || echo '<server-ip>')"
           SERVER_PUB=$(sudo cat /etc/wireguard/server_public.key)
@@ -88,12 +94,27 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Endpoint | \`${PUBLIC_IP}:${LISTEN_PORT}/udp\` |"
+            echo "| Public WG endpoint | \`${PUBLIC_IP}:${LISTEN_PORT}/udp\` (firewalled to loopback only) |"
             echo "| Subnet | \`${SUBNET}\` |"
             echo "| Server pubkey | \`${SERVER_PUB}\` |"
+            echo "| wg-client.conf Endpoint | \`${CLIENT_ENDPOINT}\` |"
+            echo ""
+            echo "### Why \`Endpoint = ${CLIENT_ENDPOINT}\` in the client config"
+            echo ""
+            echo "The WireGuard server-side listen port is locked to loopback (iptables drop"
+            echo "for non-127.0.0.0/8). The intended data path is:"
+            echo ""
+            echo "\`\`\`"
+            echo "Client WG → 127.0.0.1:9000 (local TP) → DTLS → ${PUBLIC_IP}:56010 (vk-turn-proxy@udp) → 127.0.0.1:51820 (wg-quick)"
+            echo "\`\`\`"
+            echo ""
+            echo "If the WG \`Endpoint\` were the public IP, WG would try to reach it directly"
+            echo "and get blocked by the loopback-only firewall. Pointing WG at the local TP"
+            echo "listener (\`${CLIENT_ENDPOINT}\` by default) hands every WG packet to the proxy."
             echo ""
             echo "### Next steps"
-            echo "1. Download the **wg-client-config** artifact from this run for \`wg-client.conf\` (contains the client private key)."
-            echo "2. Open UDP/${LISTEN_PORT} in the cloud firewall / security group."
-            echo "3. Run **Deploy** workflow once more — bootstrap will detect WireGuard and add a \`vk-turn-proxy@udp\` instance."
+            echo "1. Download the **wg-client-config** artifact from this run."
+            echo "2. **Re-import** it into the client app (the Endpoint changed — old configs won't work anymore)."
+            echo "3. Trigger **Deploy** if you haven't yet (or it has already auto-run)."
+            echo "4. Reconnect — \`wg show\` on the server should now show \`endpoint: 127.0.0.1:<random>\` and \`latest handshake\` ticking."
           } >> "$GITHUB_STEP_SUMMARY"
