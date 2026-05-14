@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,10 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	aggregate := flag.Bool("aggregate", false, "Aggregate N DTLS streams per client into a single backend UDP socket. "+
+		"When enabled, each DTLS stream MUST send a 16-byte session ID immediately after the handshake. "+
+		"Replies from the backend are round-robined across the streams that share the ID. "+
+		"WIRE-INCOMPATIBLE with non-aggregating clients — turn this on only when every client speaks the protocol.")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,7 +77,16 @@ func main() {
 		}
 	})
 
-	fmt.Println("Listening")
+	if *aggregate {
+		fmt.Println("Listening (aggregate mode)")
+	} else {
+		fmt.Println("Listening")
+	}
+
+	var sessions *sessionManager
+	if *aggregate {
+		sessions = newSessionManager()
+	}
 
 	wg1 := sync.WaitGroup{}
 	for {
@@ -114,14 +128,205 @@ func main() {
 			}
 			log.Println("Handshake done")
 
-			if *vlessMode {
+			switch {
+			case *vlessMode:
 				handleVLESSConnection(ctx, dtlsConn, *connect)
-			} else {
+			case *aggregate:
+				handleAggregatedUDPConnection(ctx, conn, *connect, sessions)
+			default:
 				handleUDPConnection(ctx, conn, *connect)
 			}
 
 			log.Printf("Connection closed: %s\n", conn.RemoteAddr())
 		}(conn)
+	}
+}
+
+// ---------- session aggregation (port of kiper292/vk-turn-proxy) ----------
+
+// userSession owns one UDP socket to the backend (e.g. wg-quick@wg0) and a
+// list of DTLS connections that share it. Upstream packets from every DTLS
+// stream flow into the single backendConn; downstream packets from
+// backendConn are round-robined across the DTLS streams. WireGuard's own
+// replay window absorbs the resulting reordering.
+type userSession struct {
+	id          string
+	backendConn net.Conn
+	manager     *sessionManager
+	ctx         context.Context
+	cancel      context.CancelFunc
+
+	lock     sync.RWMutex
+	conns    []net.Conn
+	lastUsed uint32 // atomic counter for round-robin downstream selection
+}
+
+type sessionManager struct {
+	lock     sync.Mutex
+	sessions map[string]*userSession
+}
+
+func newSessionManager() *sessionManager {
+	return &sessionManager{sessions: make(map[string]*userSession)}
+}
+
+func (m *sessionManager) getOrCreate(ctx context.Context, id, connectAddr string) (*userSession, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if s, ok := m.sessions[id]; ok {
+		return s, nil
+	}
+	backend, err := net.Dial("udp", connectAddr)
+	if err != nil {
+		return nil, err
+	}
+	sessCtx, cancel := context.WithCancel(ctx)
+	s := &userSession{
+		id:          id,
+		backendConn: backend,
+		manager:     m,
+		ctx:         sessCtx,
+		cancel:      cancel,
+	}
+	m.sessions[id] = s
+	go s.backendReaderLoop()
+	return s, nil
+}
+
+func (s *userSession) addConn(c net.Conn) {
+	s.lock.Lock()
+	s.conns = append(s.conns, c)
+	s.lock.Unlock()
+}
+
+func (s *userSession) removeConn(c net.Conn) {
+	s.lock.Lock()
+	for i, x := range s.conns {
+		if x == c {
+			s.conns = append(s.conns[:i], s.conns[i+1:]...)
+			break
+		}
+	}
+	s.lock.Unlock()
+}
+
+// backendReaderLoop reads packets from the shared backend UDP socket and
+// dispatches each one to ONE of the currently-attached DTLS conns. The
+// 5-minute deadline doubles as an idle-session reaper: when no client
+// stream has written anything in 5 minutes, the read errors out and the
+// session is torn down.
+func (s *userSession) backendReaderLoop() {
+	defer s.cleanup()
+	buf := make([]byte, 1600)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+		if err := s.backendConn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			log.Printf("session %s backend SetReadDeadline: %v", s.id, err)
+			return
+		}
+		n, err := s.backendConn.Read(buf)
+		if err != nil {
+			log.Printf("session %s backend read: %v", s.id, err)
+			return
+		}
+
+		s.lock.RLock()
+		if len(s.conns) == 0 {
+			s.lock.RUnlock()
+			continue
+		}
+		idx := atomic.AddUint32(&s.lastUsed, 1) % uint32(len(s.conns))
+		target := s.conns[idx]
+		s.lock.RUnlock()
+
+		if err := target.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			log.Printf("session %s DTLS SetWriteDeadline: %v", s.id, err)
+			continue
+		}
+		if _, err := target.Write(buf[:n]); err != nil {
+			log.Printf("session %s DTLS write: %v", s.id, err)
+			// the per-stream goroutine that owns `target` will hit its own
+			// read error next and call removeConn, so we just skip here.
+		}
+	}
+}
+
+func (s *userSession) cleanup() {
+	s.cancel()
+	_ = s.backendConn.Close()
+
+	s.manager.lock.Lock()
+	delete(s.manager.sessions, s.id)
+	s.manager.lock.Unlock()
+
+	s.lock.Lock()
+	for _, c := range s.conns {
+		_ = c.Close()
+	}
+	s.conns = nil
+	s.lock.Unlock()
+}
+
+// handleAggregatedUDPConnection handles one DTLS stream within an aggregate
+// session. The first 16 bytes after the handshake are the session ID; all
+// subsequent reads are forwarded to the session's shared backend socket.
+func handleAggregatedUDPConnection(ctx context.Context, conn net.Conn, connectAddr string, sm *sessionManager) {
+	idBuf := make([]byte, 16)
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("aggregate: SetReadDeadline for session id: %v", err)
+		return
+	}
+	if _, err := io.ReadFull(conn, idBuf); err != nil {
+		log.Printf("aggregate: read session id: %v", err)
+		return
+	}
+	sessionID := fmt.Sprintf("%x", idBuf)
+
+	session, err := sm.getOrCreate(ctx, sessionID, connectAddr)
+	if err != nil {
+		log.Printf("aggregate: getOrCreate session %s: %v", sessionID, err)
+		return
+	}
+	session.addConn(conn)
+	defer session.removeConn(conn)
+
+	log.Printf("aggregate: stream attached to session %s from %s", sessionID, conn.RemoteAddr())
+
+	buf := make([]byte, 1600)
+	for {
+		select {
+		case <-session.ctx.Done():
+			return
+		default:
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(10 * time.Minute)); err != nil {
+			log.Printf("aggregate: session %s SetReadDeadline: %v", sessionID, err)
+			return
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			log.Printf("aggregate: session %s stream read: %v", sessionID, err)
+			return
+		}
+
+		// Drop the turnbridge keepalive sentinel (4 bytes of 0xFF) — same
+		// reasoning as in handleUDPConnection.
+		if n == 4 && buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF && buf[3] == 0xFF {
+			continue
+		}
+
+		if err := session.backendConn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			log.Printf("aggregate: session %s backend SetWriteDeadline: %v", sessionID, err)
+			return
+		}
+		if _, err := session.backendConn.Write(buf[:n]); err != nil {
+			log.Printf("aggregate: session %s backend write: %v", sessionID, err)
+			return
+		}
 	}
 }
 
