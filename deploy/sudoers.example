@@ -7,7 +7,12 @@
 #   sudo visudo -cf /etc/sudoers.d/vk-turn-proxy-runner
 
 github-runner ALL=(root) NOPASSWD: /usr/bin/install -m 0755 -o root -g root * /opt/vk-turn-proxy/server.new
+github-runner ALL=(root) NOPASSWD: /usr/bin/install -m 0755 -o root -g root * /opt/vk-turn-proxy/captcha-service.new
 github-runner ALL=(root) NOPASSWD: /bin/mv -f /opt/vk-turn-proxy/server.new /opt/vk-turn-proxy/server
+github-runner ALL=(root) NOPASSWD: /bin/mv -f /opt/vk-turn-proxy/captcha-service.new /opt/vk-turn-proxy/captcha-service
 github-runner ALL=(root) NOPASSWD: /bin/systemctl restart vk-turn-proxy@*.service
+github-runner ALL=(root) NOPASSWD: /bin/systemctl restart captcha-service.service
 github-runner ALL=(root) NOPASSWD: /bin/systemctl is-enabled vk-turn-proxy@*.service
+github-runner ALL=(root) NOPASSWD: /bin/systemctl is-enabled captcha-service.service
 github-runner ALL=(root) NOPASSWD: /bin/systemctl is-active vk-turn-proxy@*.service
+github-runner ALL=(root) NOPASSWD: /bin/systemctl is-active captcha-service.service

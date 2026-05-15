@@ -31,11 +31,13 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL_DIR="/opt/vk-turn-proxy"
 CONFIG_DIR="/etc/vk-turn-proxy"
 UNIT_PATH="/etc/systemd/system/vk-turn-proxy@.service"
+CAPTCHA_UNIT_PATH="/etc/systemd/system/captcha-service.service"
 
 install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0750 "$CONFIG_DIR"
 
 install -m 0644 "$REPO_DIR/deploy/vk-turn-proxy@.service" "$UNIT_PATH"
+install -m 0644 "$REPO_DIR/deploy/captcha-service.service" "$CAPTCHA_UNIT_PATH"
 
 port_owner() {
     local port="$1"
@@ -91,6 +93,24 @@ if [ -n "${VLESS_CONNECT:-}" ]; then
     write_env vless "${VLESS_LISTEN:-$VLESS_LISTEN_DEFAULT}" "$VLESS_CONNECT" "-vless"
 fi
 
+# captcha-service: generate API_KEY on first install, then leave the env
+# file alone forever (key rotation is a manual op so we don't break the
+# iOS client without warning).
+CAPTCHA_ENV="$CONFIG_DIR/captcha-service.env"
+CAPTCHA_LISTEN_DEFAULT="${CAPTCHA_LISTEN:-:18080}"
+if [ ! -e "$CAPTCHA_ENV" ]; then
+    api_key=$(openssl rand -hex 32)
+    umask 027
+    cat > "$CAPTCHA_ENV" <<EOF
+LISTEN_ADDR=${CAPTCHA_LISTEN_DEFAULT}
+API_KEY=${api_key}
+EOF
+    chmod 0640 "$CAPTCHA_ENV"
+    echo "Wrote $CAPTCHA_ENV with a freshly generated API_KEY."
+else
+    echo "$CAPTCHA_ENV preserved (existing API_KEY kept)."
+fi
+
 systemctl daemon-reload
 
 if [ -n "${UDP_CONNECT:-}" ] && [ -e "$CONFIG_DIR/udp.env" ]; then
@@ -101,12 +121,20 @@ if [ -n "${VLESS_CONNECT:-}" ] && [ -e "$CONFIG_DIR/vless.env" ]; then
     systemctl enable vk-turn-proxy@vless.service
     echo "Enabled vk-turn-proxy@vless.service."
 fi
+if [ -e "$CAPTCHA_ENV" ]; then
+    systemctl enable captcha-service.service
+    echo "Enabled captcha-service.service."
+fi
 
 cat <<'MSG'
 
 install.sh complete. Trigger the GitHub Actions "Deploy" workflow (or push
-to main) to build the binary and (re)start enabled instances.
+to main) to build the binaries and (re)start enabled instances.
 
 Watch:  journalctl -u 'vk-turn-proxy@udp' -f
         journalctl -u 'vk-turn-proxy@vless' -f
+        journalctl -u 'captcha-service' -f
+
+Read the captcha-service API key (paste into the iOS app):
+  sudo grep API_KEY /etc/vk-turn-proxy/captcha-service.env
 MSG
