@@ -227,7 +227,7 @@ func callCaptchaNotRobotWithSliderPOC(
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
-	if err := session.requestComponentDone(); err != nil {
+	if err = session.requestComponentDone(); err != nil {
 		return "", err
 	}
 

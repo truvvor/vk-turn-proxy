@@ -438,8 +438,8 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 		return
 	}
 	defer func() {
-		if err := kcpSess.Close(); err != nil {
-			log.Printf("failed to close KCP session: %v", err)
+		if closeErr := kcpSess.Close(); closeErr != nil {
+			log.Printf("failed to close KCP session: %v", closeErr)
 		}
 	}()
 	log.Printf("KCP session established (server)")
