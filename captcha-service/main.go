@@ -319,6 +319,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		SaturatedNow  bool       `json:"saturated_now"`
 		UptimeSeconds int64      `json:"uptime_seconds"`
 		Peers         []peerStat `json:"peers"`
+		OutboundPool  []string   `json:"outbound_pool"`
 	}{
 		Attempts:      stats.attempts,
 		Successes:     stats.successes,
@@ -329,6 +330,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		SaturatedNow:  directSaturated(),
 		UptimeSeconds: int64(time.Since(startedAt).Seconds()),
 		Peers:         peerStats,
+		OutboundPool:  outboundPoolSnapshot(),
 	}
 	stats.mu.Unlock()
 	writeJSON(w, http.StatusOK, snap)

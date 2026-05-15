@@ -25,6 +25,10 @@
 // passes the request URL host as SNI/ServerName regardless of what
 // DialContext returned), so dialing to a raw IP doesn't break cert
 // verification.
+//
+// Source-IP selection lives in outbound.go (outboundDialer) — see
+// there for the rotation pool. Every dialer in this file goes through
+// outboundDialer so each new connection lands on the next pool IP.
 
 package main
 
@@ -37,7 +41,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,41 +52,6 @@ const (
 	systemDialBudget = 4 * time.Second
 	dohDialBudget    = 6 * time.Second
 )
-
-// outboundBindIP is the source address every captcha-bound dialer
-// uses for connect(2). When empty (default) the kernel picks the
-// outgoing source as it would normally. When set via the
-// OUTBOUND_BIND_IP env var, all VK + DoH traffic egresses from that
-// IP — useful on a multi-homed VPS where one of the v4 addresses is
-// already burned by VK's ERROR_LIMIT and we want a fresh per-IP
-// budget without spinning up another VPS.
-var outboundBindIP net.IP
-
-// initOutboundBindIP must be called once at process start before any
-// HTTP client construction. Reads OUTBOUND_BIND_IP and stashes the
-// parsed address in the package-level var.
-func initOutboundBindIP() {
-	v := strings.TrimSpace(os.Getenv("OUTBOUND_BIND_IP"))
-	if v == "" {
-		return
-	}
-	ip := net.ParseIP(v)
-	if ip == nil {
-		log.Fatalf("OUTBOUND_BIND_IP=%q is not a valid IP literal", v)
-	}
-	outboundBindIP = ip
-	log.Printf("outbound: binding to %s for VK + DoH traffic", ip)
-}
-
-// outboundDialer returns a net.Dialer with the configured timeout and,
-// when OUTBOUND_BIND_IP was set, LocalAddr pinned to that IP.
-func outboundDialer(timeout time.Duration) *net.Dialer {
-	d := &net.Dialer{Timeout: timeout}
-	if outboundBindIP != nil {
-		d.LocalAddr = &net.TCPAddr{IP: outboundBindIP}
-	}
-	return d
-}
 
 // dohClient is used ONLY for the DoH lookup itself. Plain net.Dialer
 // so we don't recurse into customDial. DialContext is a closure rather
