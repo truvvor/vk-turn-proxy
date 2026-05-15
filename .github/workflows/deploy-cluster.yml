@@ -1,0 +1,257 @@
+name: Deploy captcha cluster
+
+# Builds and rolls out captcha-service to every named runner in the
+# cluster (us, ubuntu, ukoverheat). Phase 1 installs the binary on each
+# host and reports its public IP back via an artifact. Phase 2 takes the
+# collected IPs, builds the PEERS env value, and writes the env file +
+# restarts the service on each host so every node knows every other
+# node.
+#
+# Auth: every node uses the SAME bearer token (repo secret CLUSTER_API_KEY).
+# Generate one with `openssl rand -hex 32` and add it under
+# Settings → Secrets and variables → Actions before running this workflow.
+# If the secret is empty the install phase fails fast with a clear message.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy (defaults to the workflow's commit)
+        required: false
+        default: ''
+      port:
+        description: TCP port for captcha-service
+        required: false
+        default: '18080'
+
+concurrency:
+  # Serialise cluster rolls; never tear down a roll mid-flight.
+  group: deploy-cluster
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify CLUSTER_API_KEY is set
+        env:
+          KEY: ${{ secrets.CLUSTER_API_KEY }}
+        run: |
+          if [ -z "${KEY}" ]; then
+            echo "::error::Repo secret CLUSTER_API_KEY is empty. Generate one with"
+            echo "::error::'openssl rand -hex 32' and add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          # Don't print the key. Just confirm length looks plausible.
+          echo "CLUSTER_API_KEY present, length=${#KEY}"
+
+  install:
+    name: Install binary on ${{ matrix.runner }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [us, ubuntu, ukoverheat]
+    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.5'
+          cache-dependency-path: captcha-service/go.sum
+
+      - name: Build captcha-service binary
+        working-directory: ./captcha-service
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -ldflags "-s -w" -trimpath \
+            -o "$GITHUB_WORKSPACE/dist/captcha-service" .
+          ls -la "$GITHUB_WORKSPACE/dist/captcha-service"
+
+      - name: Install systemd unit + binary (idempotent)
+        run: |
+          set -e
+          sudo install -d -m 0755 /opt/vk-turn-proxy
+          sudo install -d -m 0750 /etc/vk-turn-proxy
+          sudo install -m 0644 deploy/captcha-service.service /etc/systemd/system/captcha-service.service
+          sudo install -m 0755 -o root -g root dist/captcha-service /opt/vk-turn-proxy/captcha-service.new
+          sudo mv -f /opt/vk-turn-proxy/captcha-service.new /opt/vk-turn-proxy/captcha-service
+          sudo systemctl daemon-reload
+
+      - name: Detect public IP and export to artifact
+        id: ip
+        run: |
+          IP=$(curl -fsS --max-time 5 https://api.ipify.org \
+               || curl -fsS --max-time 5 https://ifconfig.me \
+               || echo "")
+          if [ -z "$IP" ]; then
+            echo "::error::Could not determine public IP via ipify or ifconfig.me"
+            exit 1
+          fi
+          echo "Detected public IP: $IP"
+          mkdir -p out
+          echo "$IP" > "out/${{ matrix.runner }}.txt"
+
+      - name: Upload IP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ip-${{ matrix.runner }}
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  configure:
+    name: Configure ${{ matrix.runner }} (PEERS + restart)
+    needs: install
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [us, ubuntu, ukoverheat]
+    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
+    steps:
+      - name: Download all IP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ip-*
+          path: ips/
+          merge-multiple: true
+
+      - name: Compose env file and restart captcha-service
+        env:
+          API_KEY: ${{ secrets.CLUSTER_API_KEY }}
+          PORT: ${{ inputs.port }}
+          MY_RUNNER: ${{ matrix.runner }}
+        run: |
+          set -e
+
+          # Load each peer IP from the artifact directory; fail loudly if
+          # any is missing (the cluster needs all members to know each
+          # other; partial PEERS would silently break round-robin).
+          read_ip() {
+            local label="$1"
+            if [ ! -f "ips/${label}.txt" ]; then
+              echo "::error::missing ips/${label}.txt — install job on ${label} did not upload"
+              exit 1
+            fi
+            tr -d '[:space:]' < "ips/${label}.txt"
+          }
+
+          US_IP=$(read_ip us)
+          UBUNTU_IP=$(read_ip ubuntu)
+          UKOVERHEAT_IP=$(read_ip ukoverheat)
+
+          PEERS=""
+          for entry in "us:${US_IP}" "ubuntu:${UBUNTU_IP}" "ukoverheat:${UKOVERHEAT_IP}"; do
+            label="${entry%%:*}"
+            ip="${entry#*:}"
+            url="http://${ip}:${PORT}"
+            PEERS="${PEERS:+${PEERS},}${url}|${API_KEY}"
+          done
+
+          case "$MY_RUNNER" in
+            us)         MY_IP="$US_IP" ;;
+            ubuntu)     MY_IP="$UBUNTU_IP" ;;
+            ukoverheat) MY_IP="$UKOVERHEAT_IP" ;;
+          esac
+          SELF_URL="http://${MY_IP}:${PORT}"
+
+          # Write the env file via a temp + mv so an in-flight read on
+          # the running unit doesn't see a half-written file.
+          tmp=$(mktemp)
+          cat > "$tmp" <<EOF
+          LISTEN_ADDR=:${PORT}
+          API_KEY=${API_KEY}
+          PEERS=${PEERS}
+          SELF_URL=${SELF_URL}
+          EOF
+          sudo install -m 0640 -o root -g root "$tmp" /etc/vk-turn-proxy/captcha-service.env
+          rm -f "$tmp"
+
+          sudo systemctl enable captcha-service.service
+          sudo systemctl restart captcha-service.service
+          sleep 2
+          sudo systemctl is-active captcha-service.service
+
+      - name: Healthcheck
+        id: health
+        run: |
+          set -e
+          PORT="${{ inputs.port }}"
+          # Self-healthz via localhost (avoids needing the firewall open
+          # for the inbound check to succeed during the workflow itself).
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/healthz" | grep -q '^ok$'; then
+              echo "healthz ok"
+              exit 0
+            fi
+            echo "healthz attempt $i failed, retrying..."
+            sleep 1
+          done
+          echo "::error::healthz did not return 'ok' after 5 tries"
+          sudo journalctl -u captcha-service.service -n 40 --no-pager
+          exit 1
+
+      - name: Summary
+        if: success()
+        env:
+          PORT: ${{ inputs.port }}
+          MY_RUNNER: ${{ matrix.runner }}
+        run: |
+          MY_IP=$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo "<ip>")
+          {
+            echo "### ${MY_RUNNER} (\`${MY_IP}:${PORT}\`)"
+            echo ""
+            sudo systemctl --no-pager --lines=10 status captcha-service.service | head -15
+            echo ""
+            echo "Stats snapshot:"
+            echo '```json'
+            curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/stats"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  post:
+    name: Cluster summary
+    needs: configure
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download IP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ip-*
+          path: ips/
+          merge-multiple: true
+
+      - name: Print cluster overview
+        env:
+          PORT: ${{ inputs.port }}
+        run: |
+          {
+            echo "## Cluster"
+            echo ""
+            echo "| Node | URL |"
+            echo "|---|---|"
+            for label in us ubuntu ukoverheat; do
+              if [ -f "ips/${label}.txt" ]; then
+                ip=$(tr -d '[:space:]' < "ips/${label}.txt")
+                echo "| ${label} | \`http://${ip}:${PORT}\` |"
+              fi
+            done
+            echo ""
+            echo "iOS client points to **any one** of these URLs (the entry-point"
+            echo "node acts as master for that request and round-robins among all"
+            echo "peers transparently). For convenience keep the existing iOS"
+            echo "config (us) — it'll fan out automatically."
+            echo ""
+            echo "API key: still the value of the \`CLUSTER_API_KEY\` repo secret."
+            echo "Don't forget to open TCP/${PORT} in the cloud firewall on every node."
+          } >> "$GITHUB_STEP_SUMMARY"
