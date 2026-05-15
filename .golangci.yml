@@ -49,13 +49,14 @@ linters:
       - third_party$
       - builtin$
       - examples$
+    # v2 location for what used to live under issues.exclude-rules.
+    rules:
+      - linters:
+          - errcheck
+        source: "doRequest|packetPool\\.Get"
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - linters:
-        - errcheck
-      source: "doRequest|packetPool\\.Get"
 formatters:
   exclusions:
     generated: lax
