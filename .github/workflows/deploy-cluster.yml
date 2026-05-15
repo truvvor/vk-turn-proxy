@@ -35,7 +35,9 @@ concurrency:
 jobs:
   preflight:
     name: Preflight
-    runs-on: ubuntu-latest
+    # Run on a self-hosted runner — we don't depend on hosted Ubuntu
+    # tooling here, and hosted minutes may be unavailable on this repo.
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Verify CLUSTER_API_KEY is set
         env:
@@ -235,7 +237,7 @@ jobs:
   post:
     name: Cluster summary
     needs: configure
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     if: always()
     steps:
       - name: Download IP artifacts
