@@ -43,8 +43,8 @@ import (
 )
 
 const (
-	dohURL         = "https://1.1.1.1/dns-query"
-	dohCacheTTL    = 10 * time.Minute
+	dohURL           = "https://1.1.1.1/dns-query"
+	dohCacheTTL      = 10 * time.Minute
 	systemDialBudget = 4 * time.Second
 	dohDialBudget    = 6 * time.Second
 )

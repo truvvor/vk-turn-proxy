@@ -61,10 +61,10 @@ func requestManualCaptcha(redirectURI string, timeout time.Duration) (string, er
 // the live counter UI; on server we keep an in-memory tally for the
 // /stats endpoint and trip saturation on ERROR_LIMIT.
 type captchaStats struct {
-	mu                    sync.Mutex
-	attempts, successes   int64
-	saturatedTotal        int64
-	inFlight              int64
+	mu                  sync.Mutex
+	attempts, successes int64
+	saturatedTotal      int64
+	inFlight            int64
 }
 
 var stats captchaStats

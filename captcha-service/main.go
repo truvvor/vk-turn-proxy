@@ -166,14 +166,14 @@ func handleCred(w http.ResponseWriter, r *http.Request) {
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	stats.mu.Lock()
 	snap := struct {
-		Attempts       int64 `json:"attempts"`
-		Successes      int64 `json:"successes"`
-		Saturated      int64 `json:"saturated"`
-		InFlight       int64 `json:"in_flight"`
-		CredsTotal     int64 `json:"creds_total"`
-		CredsErrors    int64 `json:"creds_errors"`
-		SaturatedNow   bool  `json:"saturated_now"`
-		UptimeSeconds  int64 `json:"uptime_seconds"`
+		Attempts      int64 `json:"attempts"`
+		Successes     int64 `json:"successes"`
+		Saturated     int64 `json:"saturated"`
+		InFlight      int64 `json:"in_flight"`
+		CredsTotal    int64 `json:"creds_total"`
+		CredsErrors   int64 `json:"creds_errors"`
+		SaturatedNow  bool  `json:"saturated_now"`
+		UptimeSeconds int64 `json:"uptime_seconds"`
 	}{
 		Attempts:      stats.attempts,
 		Successes:     stats.successes,
