@@ -8,8 +8,12 @@ linters:
     - revive
   settings:
     errcheck:
-      check-type-assertions: true
-      check-blank: true
+      # Type assertions return (T, bool), not (T, error); we already use
+      # the `, _` pattern in lots of places to mean "treat missing as
+      # zero value". check-blank=true conflates that with discarding an
+      # actual error, so keep it off.
+      check-type-assertions: false
+      check-blank: false
       exclude-functions:
         - (net.PacketConn).WriteTo
         - (net.Conn).Write
@@ -49,13 +53,14 @@ linters:
       - third_party$
       - builtin$
       - examples$
+    # v2 location for what used to live under issues.exclude-rules.
+    rules:
+      - linters:
+          - errcheck
+        source: "doRequest|packetPool\\.Get"
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - linters:
-        - errcheck
-      source: "doRequest|packetPool\\.Get"
 formatters:
   exclusions:
     generated: lax
