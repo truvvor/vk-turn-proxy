@@ -1,0 +1,243 @@
+name: Verify cluster
+
+# End-to-end health/distribution check for the captcha-service cluster.
+# Two modes:
+#
+#   static (default)      — Single snapshot. Confirms each node is alive,
+#                           every node sees the same peer list, every peer
+#                           is marked available, and nothing is saturated.
+#                           No client traffic needed.
+#
+#   distribution (wait>0) — Two snapshots `wait` seconds apart. While the
+#                           workflow sleeps, the operator triggers an iOS
+#                           Connect. After the wait, deltas per node are
+#                           printed: this confirms /cred fan-out (the
+#                           counter must grow on at least 2 of 3 nodes).
+#
+# The workflow only reads /stats and /healthz which are unauthenticated,
+# so no CLUSTER_API_KEY secret is required to run it.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      master_url:
+        description: Master URL (the one iOS points at). Used to discover the peer list.
+        required: false
+        default: 'http://77.90.8.199:18080'
+      wait_seconds:
+        description: Seconds between snapshots (0 = static, >0 = distribution mode)
+        required: false
+        default: '0'
+
+concurrency:
+  group: verify-cluster
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify cluster
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Ensure HOME / tooling
+        shell: bash
+        run: |
+          if [ -z "${HOME:-}" ]; then
+            echo "HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          fi
+          # jq is required for parsing /stats; install if missing.
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq not found on this runner. Install via 'sudo apt install -y jq'."
+            exit 1
+          fi
+
+      - name: Snapshot 1 (or only snapshot in static mode)
+        id: snap1
+        env:
+          MASTER: ${{ inputs.master_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. Discover peer URLs by asking the master.
+          if ! master_stats=$(curl -fsS --max-time 5 "${MASTER}/stats"); then
+            echo "::error::master ${MASTER}/stats unreachable"
+            exit 1
+          fi
+
+          # peer URLs as seen by master. `self` entries have url="self" — we
+          # substitute the master URL for them so the table is readable.
+          mapfile -t PEER_URLS < <(jq -r --arg master "$MASTER" '
+            .peers[] | (if .self then $master else .url end)
+          ' <<<"$master_stats")
+
+          if [ "${#PEER_URLS[@]}" -eq 0 ]; then
+            echo "::error::master returned an empty peer list"
+            exit 1
+          fi
+
+          echo "Discovered peers from master ${MASTER}:"
+          printf '  %s\n' "${PEER_URLS[@]}"
+
+          # 2. For each peer, fetch /stats and write to disk as snapshots.
+          mkdir -p snap1
+          for url in "${PEER_URLS[@]}"; do
+            label=$(echo "$url" | sed 's|https\{0,1\}://||; s|[:/]|_|g')
+            if ! body=$(curl -fsS --max-time 5 "${url}/stats"); then
+              echo "::error::peer ${url}/stats unreachable"
+              echo '{"unreachable": true}' > "snap1/${label}.json"
+              continue
+            fi
+            echo "$body" > "snap1/${label}.json"
+          done
+
+          # 3. Static validation: every node should agree on the peer list.
+          fail=0
+          first_peers_set=""
+          for f in snap1/*.json; do
+            if jq -e '.unreachable == true' "$f" >/dev/null 2>&1; then
+              echo "::error::$(basename "$f") was unreachable"
+              fail=1
+              continue
+            fi
+            this_peers=$(jq -S '[.peers[].url] | sort' "$f")
+            if [ -z "$first_peers_set" ]; then
+              first_peers_set="$this_peers"
+              continue
+            fi
+            if [ "$this_peers" != "$first_peers_set" ]; then
+              echo "::error::peer list mismatch on $(basename "$f"):"
+              diff <(echo "$first_peers_set") <(echo "$this_peers") || true
+              fail=1
+            fi
+          done
+
+          # 4. Availability + saturation.
+          for f in snap1/*.json; do
+            if jq -e '.unreachable == true' "$f" >/dev/null 2>&1; then continue; fi
+            if jq -e '.peers[] | select(.available == false)' "$f" >/dev/null 2>&1; then
+              echo "::warning::$(basename "$f") sees one or more peers unavailable:"
+              jq '.peers[] | select(.available == false)' "$f"
+            fi
+            if jq -e '.saturated_now == true' "$f" >/dev/null 2>&1; then
+              echo "::warning::$(basename "$f") is saturated_now=true"
+            fi
+          done
+
+          if [ "$fail" -eq 0 ]; then
+            echo "static checks: PASS"
+          else
+            echo "::error::static checks: FAIL"
+            exit 1
+          fi
+
+      - name: Wait (distribution mode only)
+        if: ${{ inputs.wait_seconds != '0' && inputs.wait_seconds != '' }}
+        env:
+          WAIT: ${{ inputs.wait_seconds }}
+        shell: bash
+        run: |
+          set -e
+          echo "Waiting ${WAIT}s for traffic. Trigger an iOS Connect now if you haven't."
+          # Print a heartbeat so the workflow tab isn't silent for long waits.
+          for i in $(seq "$WAIT"); do
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "  ...${i}/${WAIT}s elapsed"
+            fi
+            sleep 1
+          done
+
+      - name: Snapshot 2 + delta (distribution mode only)
+        if: ${{ inputs.wait_seconds != '0' && inputs.wait_seconds != '' }}
+        env:
+          MASTER: ${{ inputs.master_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          master_stats=$(curl -fsS --max-time 5 "${MASTER}/stats")
+          mapfile -t PEER_URLS < <(jq -r --arg master "$MASTER" '
+            .peers[] | (if .self then $master else .url end)
+          ' <<<"$master_stats")
+
+          mkdir -p snap2
+          for url in "${PEER_URLS[@]}"; do
+            label=$(echo "$url" | sed 's|https\{0,1\}://||; s|[:/]|_|g')
+            body=$(curl -fsS --max-time 5 "${url}/stats" || echo '{}')
+            echo "$body" > "snap2/${label}.json"
+          done
+
+          # Compute per-node deltas and accumulate totals.
+          echo "## Distribution over ${{ inputs.wait_seconds }}s window" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Node | creds_total Δ | successes Δ | errors Δ | in_flight (now) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+
+          total_delta=0
+          nonzero_nodes=0
+          for f1 in snap1/*.json; do
+            label=$(basename "$f1" .json)
+            f2="snap2/${label}.json"
+            if [ ! -f "$f2" ]; then continue; fi
+
+            delta_creds=$(jq -n --slurpfile a "$f1" --slurpfile b "$f2" '
+              ($b[0].creds_total // 0) - ($a[0].creds_total // 0)')
+            delta_succ=$(jq -n --slurpfile a "$f1" --slurpfile b "$f2" '
+              ($b[0].successes // 0) - ($a[0].successes // 0)')
+            delta_err=$(jq -n --slurpfile a "$f1" --slurpfile b "$f2" '
+              ($b[0].creds_errors // 0) - ($a[0].creds_errors // 0)')
+            in_flight=$(jq -r '.in_flight // 0' "$f2")
+
+            echo "| ${label} | ${delta_creds} | ${delta_succ} | ${delta_err} | ${in_flight} |" >> "$GITHUB_STEP_SUMMARY"
+
+            total_delta=$((total_delta + delta_creds))
+            if [ "$delta_creds" -gt 0 ]; then
+              nonzero_nodes=$((nonzero_nodes + 1))
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$total_delta" -eq 0 ]; then
+            echo "**No traffic** during the wait window. Can't verify fan-out — re-run with an iOS Connect during the next wait." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::no traffic observed"
+            exit 0
+          fi
+
+          # Fan-out interpretation:
+          #   1 node with delta > 0  → master is solving everything locally, fan-out is broken
+          #   2+ nodes               → routing across peers is working
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$nonzero_nodes" -ge 2 ]; then
+            echo "✅ **Fan-out OK** — ${nonzero_nodes} of $(ls snap1/*.json | wc -l) nodes served captchas." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ **Fan-out broken** — only ${nonzero_nodes} node served captchas; expected ≥2 for cluster mode." >> "$GITHUB_STEP_SUMMARY"
+            echo "Possible causes: PEERS env missing the other URLs, peer auth (API_KEY mismatch), or peers unavailable." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::fan-out broken (only 1 node served traffic)"
+            exit 1
+          fi
+
+      - name: Static summary
+        if: ${{ inputs.wait_seconds == '0' || inputs.wait_seconds == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Cluster snapshot"
+            echo ""
+            echo "| Node | uptime (s) | creds_total | creds_errors | in_flight | saturated_now | peers seen | available |"
+            echo "|---|---:|---:|---:|---:|---|---:|---:|"
+            for f in snap1/*.json; do
+              label=$(basename "$f" .json)
+              uptime=$(jq -r '.uptime_seconds // 0' "$f")
+              total=$(jq -r '.creds_total // 0' "$f")
+              errors=$(jq -r '.creds_errors // 0' "$f")
+              inflight=$(jq -r '.in_flight // 0' "$f")
+              sat=$(jq -r '.saturated_now // false' "$f")
+              peers=$(jq -r '.peers | length' "$f")
+              avail=$(jq -r '[.peers[] | select(.available == true)] | length' "$f")
+              echo "| ${label} | ${uptime} | ${total} | ${errors} | ${inflight} | ${sat} | ${peers} | ${avail} |"
+            done
+            echo ""
+            echo "For a distribution check (verifies /cred fan-out actually splits work), re-run with wait_seconds=60 and trigger an iOS Connect during the wait."
+          } >> "$GITHUB_STEP_SUMMARY"
