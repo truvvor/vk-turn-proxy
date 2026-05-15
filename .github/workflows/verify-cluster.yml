@@ -82,18 +82,25 @@ jobs:
           printf '  %s\n' "${PEER_URLS[@]}"
 
           # 2. For each peer, fetch /stats and write to disk as snapshots.
+          # We augment the JSON with the URL we used to reach it
+          # (`_fetched_via`) so the validation step below can normalise
+          # the per-node "self" entry — every node's /stats reports its
+          # own peer record as `{"url":"self", "self":true}`, so without
+          # this substitution the peer-list sets across nodes differ
+          # purely in WHICH position "self" sits.
           mkdir -p snap1
           for url in "${PEER_URLS[@]}"; do
             label=$(echo "$url" | sed 's|https\{0,1\}://||; s|[:/]|_|g')
             if ! body=$(curl -fsS --max-time 5 "${url}/stats"); then
               echo "::error::peer ${url}/stats unreachable"
-              echo '{"unreachable": true}' > "snap1/${label}.json"
+              jq -n --arg u "$url" '{unreachable: true, _fetched_via: $u}' > "snap1/${label}.json"
               continue
             fi
-            echo "$body" > "snap1/${label}.json"
+            jq --arg u "$url" '. + {_fetched_via: $u}' <<<"$body" > "snap1/${label}.json"
           done
 
-          # 3. Static validation: every node should agree on the peer list.
+          # 3. Static validation: every node should agree on the peer list
+          # after we resolve "self" → the URL we used to reach that node.
           fail=0
           first_peers_set=""
           for f in snap1/*.json; do
@@ -102,7 +109,10 @@ jobs:
               fail=1
               continue
             fi
-            this_peers=$(jq -S '[.peers[].url] | sort' "$f")
+            this_peers=$(jq -S '
+              ._fetched_via as $me
+              | [.peers[] | (if .self then $me else .url end)] | sort
+            ' "$f")
             if [ -z "$first_peers_set" ]; then
               first_peers_set="$this_peers"
               continue
