@@ -37,6 +37,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -49,12 +50,52 @@ const (
 	dohDialBudget    = 6 * time.Second
 )
 
+// outboundBindIP is the source address every captcha-bound dialer
+// uses for connect(2). When empty (default) the kernel picks the
+// outgoing source as it would normally. When set via the
+// OUTBOUND_BIND_IP env var, all VK + DoH traffic egresses from that
+// IP — useful on a multi-homed VPS where one of the v4 addresses is
+// already burned by VK's ERROR_LIMIT and we want a fresh per-IP
+// budget without spinning up another VPS.
+var outboundBindIP net.IP
+
+// initOutboundBindIP must be called once at process start before any
+// HTTP client construction. Reads OUTBOUND_BIND_IP and stashes the
+// parsed address in the package-level var.
+func initOutboundBindIP() {
+	v := strings.TrimSpace(os.Getenv("OUTBOUND_BIND_IP"))
+	if v == "" {
+		return
+	}
+	ip := net.ParseIP(v)
+	if ip == nil {
+		log.Fatalf("OUTBOUND_BIND_IP=%q is not a valid IP literal", v)
+	}
+	outboundBindIP = ip
+	log.Printf("outbound: binding to %s for VK + DoH traffic", ip)
+}
+
+// outboundDialer returns a net.Dialer with the configured timeout and,
+// when OUTBOUND_BIND_IP was set, LocalAddr pinned to that IP.
+func outboundDialer(timeout time.Duration) *net.Dialer {
+	d := &net.Dialer{Timeout: timeout}
+	if outboundBindIP != nil {
+		d.LocalAddr = &net.TCPAddr{IP: outboundBindIP}
+	}
+	return d
+}
+
 // dohClient is used ONLY for the DoH lookup itself. Plain net.Dialer
-// so we don't recurse into customDial.
+// so we don't recurse into customDial. DialContext is a closure rather
+// than a bound method so it reads outboundBindIP at request time, not
+// at package-init time (init order: vars → init() → main, but
+// OUTBOUND_BIND_IP is parsed in main).
 var dohClient = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
-		DialContext:     (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return outboundDialer(4*time.Second).DialContext(ctx, network, address)
+		},
 		TLSClientConfig: &tls.Config{},
 	},
 }
@@ -93,11 +134,11 @@ func customDial(ctx context.Context, network, address string) (net.Conn, error) 
 
 	// Fast path: literal IP needs no resolution.
 	if net.ParseIP(host) != nil {
-		return (&net.Dialer{Timeout: 8 * time.Second}).DialContext(ctx, network, address)
+		return outboundDialer(8*time.Second).DialContext(ctx, network, address)
 	}
 
 	// Layer 1: system resolver.
-	d := &net.Dialer{Timeout: dohDialBudget}
+	d := outboundDialer(dohDialBudget)
 	sysCtx, cancel := context.WithTimeout(ctx, systemDialBudget)
 	conn, sysErr := d.DialContext(sysCtx, network, address)
 	cancel()
