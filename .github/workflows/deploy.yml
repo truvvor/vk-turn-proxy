@@ -15,11 +15,14 @@ on:
     paths:
       - 'server/**'
       - 'tcputil/**'
-      - 'captcha-service/**'
       - 'go.mod'
       - 'go.sum'
-      - 'deploy/**'
-      - 'scripts/**'
+      - 'deploy/vk-turn-proxy@.service'
+      - 'deploy/udp.env.example'
+      - 'deploy/vless.env.example'
+      - 'scripts/bootstrap.sh'
+      - 'scripts/install.sh'
+      - 'scripts/deploy.sh'
       - '.github/workflows/deploy.yml'
 
 concurrency:
@@ -29,7 +32,11 @@ concurrency:
 jobs:
   deploy:
     name: Build and deploy on self-hosted runner
-    runs-on: [self-hosted, linux, x64]
+    # Pinned to the `us` runner: this workflow only owns the
+    # vk-turn-proxy@udp/@vless units, which run alongside wg-quick@wg0
+    # and xray on us.overheat.cn. captcha-service is now deployed by
+    # deploy-cluster.yml across multiple runners.
+    runs-on: [self-hosted, linux, x64, us]
     steps:
       - name: Check out code
         uses: actions/checkout@v6
@@ -57,19 +64,10 @@ jobs:
             -o dist/server ./server
           ls -la dist/server
 
-      - name: Build captcha-service binary
-        # captcha-service has its own go.mod, so the build runs from inside
-        # that directory. CGO off + static linking matches the server binary
-        # so we don't depend on glibc versions on the runtime host.
-        working-directory: ./captcha-service
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -ldflags "-s -w" -trimpath \
-            -o "$GITHUB_WORKSPACE/dist/captcha-service" .
-          ls -la "$GITHUB_WORKSPACE/dist/captcha-service"
-
       - name: Deploy to host
-        run: ./scripts/deploy.sh dist/server dist/captcha-service
+        # Pass an empty second arg so deploy.sh skips the captcha-service
+        # binary swap; cluster workflow owns that now.
+        run: ./scripts/deploy.sh dist/server ""
 
       - name: Verify enabled instances are active
         id: verify
@@ -98,10 +96,9 @@ jobs:
           for instance in udp vless; do
             check_unit "vk-turn-proxy@${instance}.service"
           done
-          check_unit "captcha-service.service"
 
           if [ "$found" -eq 0 ]; then
-            echo "::error::No enabled unit found on this host (vk-turn-proxy@* / captcha-service)."
+            echo "::error::No enabled vk-turn-proxy@* unit found on this host."
             fail=1
           fi
           echo "failed_units=${failed_units# }" >> "$GITHUB_OUTPUT"
@@ -176,20 +173,6 @@ jobs:
                 echo "- **${instance}**: \`${PUBLIC_IP}:${port}\` (proxies to \`${connect}\`)"
               fi
             done
-
-            if sudo systemctl is-active captcha-service.service >/dev/null 2>&1 \
-                && sudo test -r /etc/vk-turn-proxy/captcha-service.env; then
-              listen=$(sudo grep '^LISTEN_ADDR=' /etc/vk-turn-proxy/captcha-service.env | cut -d= -f2)
-              port="${listen##*:}"
-              echo ""
-              echo "## captcha-service"
-              echo ""
-              echo "- URL: \`http://${PUBLIC_IP}:${port}\`"
-              echo "- API key: (printed only on the server, **not in logs**) — run:"
-              echo "  \`\`\`"
-              echo "  sudo grep API_KEY /etc/vk-turn-proxy/captcha-service.env"
-              echo "  \`\`\`"
-              echo "- Healthcheck: \`curl http://${PUBLIC_IP}:${port}/healthz\` → \`ok\`"
-              echo "- Open TCP/${port} in the cloud firewall so the iOS client can reach it."
-            fi
+            echo ""
+            echo "captcha-service is deployed by the **Deploy captcha cluster** workflow now."
           } >> "$GITHUB_STEP_SUMMARY"
