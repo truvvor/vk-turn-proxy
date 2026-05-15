@@ -32,16 +32,27 @@ concurrency:
 jobs:
   deploy:
     name: Build and deploy on self-hosted runner
-    # Pinned to the `us` runner: this workflow only owns the
+    # Pinned to the `ionos-us` runner: this workflow only owns the
     # vk-turn-proxy@udp/@vless units, which run alongside wg-quick@wg0
     # and xray on us.overheat.cn. captcha-service is now deployed by
     # deploy-cluster.yml across multiple runners.
-    runs-on: [self-hosted, linux, x64, us]
+    runs-on: [self-hosted, linux, x64, ionos-us]
     steps:
       - name: Check out code
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure HOME / GOCACHE are set
+        # Self-hosted runners that aren't started under a login shell can
+        # arrive here with an empty $HOME, which makes `go env` and
+        # actions/setup-go's cache step blow up. Fall back to RUNNER_TEMP.
+        shell: bash
+        run: |
+          if [ -z "${HOME:-}" ]; then
+            echo "HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
+            echo "Set HOME=$RUNNER_TEMP"
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v6
