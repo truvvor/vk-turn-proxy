@@ -58,6 +58,7 @@ func main() {
 		log.Fatal("API_KEY env var is required")
 	}
 	solveSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
+	initOutboundBindIP()
 	initPeers()
 
 	mux := http.NewServeMux()
