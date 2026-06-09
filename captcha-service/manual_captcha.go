@@ -28,10 +28,10 @@ const captchaListenPort = "8765"
 
 // headlessSolveTimeout bounds how long we wait for the headless
 // browser to deliver a success_token before tearing down the session
-// and letting the caller retry. VK's checkbox path sometimes returns
-// status:ERROR (escalation) instead of a token; without a timeout we
-// would hang.
-const headlessSolveTimeout = 35 * time.Second
+// and letting the caller retry. Budget covers worst-case slider
+// retry chain: initial checkbox click + escalation wait (~10 s) +
+// up to 4 swipes × ~5 s round-trip (~20 s) + safety margin.
+const headlessSolveTimeout = 60 * time.Second
 
 var customCaptchaHost string
 
@@ -734,13 +734,16 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity ClientIdentity) (string, error) {
 	keyCh := make(chan string, 1)
-	// Slider answer computed server-side from captchaNotRobot.getContent
-	// (see ModifyResponse below). When the headless browser swipes the
-	// thumb to trigger captchaNotRobot.check, the request body is
-	// rewritten to carry this answer — the browser only needs to fire
-	// the submit, the correct permutation is supplied by us.
+	// Slider ranker state. The Go-side fast solver tries up to
+	// content.Attempts candidates in a row when VK returns BOT; the
+	// headless path used to inject only candidates[0] which meant a
+	// wrong top-rank guess wasted all 4 swipes on the same answer.
+	// Keep the full ranked list, advance an index every time we see a
+	// non-OK check response so the NEXT swipe picks up the next-best
+	// candidate.
 	var sliderMu sync.Mutex
-	var sliderAnswerB64 string
+	var sliderCandidates []sliderCandidate
+	var sliderAttemptIdx int
 
 	targetURL, err := neturl.Parse(redirectURI)
 	if err != nil {
@@ -883,15 +886,28 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 				req.Out.URL.RawQuery = targetParsed.RawQuery
 				rewriteProxyRequest(req.Out, targetParsed)
 				applyIdentityHeaders(req.Out)
-				// Inject the ranker-computed slider answer into the
-				// check request so the browser only needs to trigger
-				// the submit (via swipe) — the correct permutation is
-				// set here. See the captchaNotRobot.getContent branch
-				// in ModifyResponse below for where the answer is
-				// computed.
+				// Inject the next ranker-computed slider answer into the
+				// check request. The browser only needs to TRIGGER the
+				// submit (via swipe); the correct permutation is set
+				// here. See the captchaNotRobot.getContent branch in
+				// ModifyResponse for where the candidate list is
+				// computed; on every BOT response below the index
+				// advances so the next swipe uses the next-best
+				// candidate, mirroring the Go-side solveSliderCaptcha
+				// retry loop.
 				if strings.Contains(targetAuthURL, "captchaNotRobot.check") {
 					sliderMu.Lock()
-					ans := sliderAnswerB64
+					var ans string
+					var candIdx, total int
+					if sliderAttemptIdx < len(sliderCandidates) {
+						cand := sliderCandidates[sliderAttemptIdx]
+						ansJSON, _ := json.Marshal(struct {
+							Value []int `json:"value"`
+						}{Value: cand.ActiveSteps})
+						ans = base64.StdEncoding.EncodeToString(ansJSON)
+						candIdx = sliderAttemptIdx
+						total = len(sliderCandidates)
+					}
 					sliderMu.Unlock()
 					if ans != "" && req.Out.Body != nil {
 						if raw, rerr := io.ReadAll(req.Out.Body); rerr == nil {
@@ -902,7 +918,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 								req.Out.Body = io.NopCloser(strings.NewReader(nb))
 								req.Out.ContentLength = int64(len(nb))
 								req.Out.Header.Set("Content-Length", fmt.Sprint(len(nb)))
-								log.Printf("[Captcha Proxy] check: injected ranker answer (%d bytes)", len(ans))
+								log.Printf("[Captcha Proxy] check: injecting candidate %d/%d (%d bytes)", candIdx+1, total, len(ans))
 							} else {
 								req.Out.Body = io.NopCloser(bytes.NewReader(raw))
 							}
@@ -932,7 +948,9 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 				// captchaNotRobot.check goes to api.vk.ru (different host from the main
 				// proxy upstream vk.com), so it is routed through /generic_proxy.
 				// Extract the success_token here so the server path works on iOS
-				// even if the browser-side JS callback never fires.
+				// even if the browser-side JS callback never fires; advance the
+				// slider candidate index on any non-OK so the NEXT swipe gets
+				// the next-best ranker answer.
 				if strings.Contains(targetAuthURL, "captchaNotRobot.check") {
 					bodyBytes, readErr := io.ReadAll(res.Body)
 					if readErr == nil {
@@ -946,6 +964,25 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 						}
 						log.Printf("[Captcha Proxy] check status=%d body=%s", res.StatusCode, snip)
 						notifyKey(keyCh, extractSuccessToken(bodyBytes))
+						// Parse the response to decide whether the slider
+						// candidate worked. status:OK with a token = solved
+						// → notifyKey already fired above. Anything else
+						// (BOT / ERROR_LIMIT / etc.) → bump the candidate
+						// index so the next swipe from the headless browser
+						// picks up the next-best ranker guess.
+						var parsed map[string]interface{}
+						if json.Unmarshal(bodyBytes, &parsed) == nil {
+							respObj, _ := parsed["response"].(map[string]interface{})
+							status, _ := respObj["status"].(string)
+							if status != "OK" {
+								sliderMu.Lock()
+								if len(sliderCandidates) > 0 {
+									sliderAttemptIdx++
+									log.Printf("[Captcha Proxy] check status=%s, advancing slider candidate to %d/%d", status, sliderAttemptIdx+1, len(sliderCandidates))
+								}
+								sliderMu.Unlock()
+							}
+						}
 					}
 				}
 				// When VK escalates to the slider it serves
@@ -966,15 +1003,21 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 						if jerr := json.Unmarshal(bodyBytes, &raw); jerr == nil {
 							if content, perr := parseSliderContent(raw); perr == nil {
 								if candidates, gerr := rankSliderCandidates(content.Image, content.GridW, content.GridH, content.Steps); gerr == nil && len(candidates) > 0 {
-									ansJSON, _ := json.Marshal(struct {
-										Value []int `json:"value"`
-									}{Value: candidates[0].ActiveSteps})
+									// Cap at the VK-imposed per-session
+									// attempt limit so we don't waste
+									// swipes past the point VK stops
+									// accepting them.
+									maxTries := content.Attempts
+									if maxTries <= 0 || maxTries > len(candidates) {
+										maxTries = len(candidates)
+									}
 									sliderMu.Lock()
-									sliderAnswerB64 = base64.StdEncoding.EncodeToString(ansJSON)
+									sliderCandidates = candidates[:maxTries]
+									sliderAttemptIdx = 0
 									sliderMu.Unlock()
-									log.Printf("[Captcha Proxy] SLIDER ranker: grid=%dx%d attempts=%d candidates=%d -> answer ready (best idx=%d score=%d)",
+									log.Printf("[Captcha Proxy] SLIDER ranker: grid=%dx%d attempts=%d candidates=%d (will try top %d, best idx=%d score=%d)",
 										content.GridW, content.GridH, content.Attempts,
-										len(candidates), candidates[0].Index, candidates[0].Score)
+										len(candidates), maxTries, candidates[0].Index, candidates[0].Score)
 								} else {
 									log.Printf("[Captcha Proxy] SLIDER getContent: grid=%dx%d attempts=%d (rank err=%v)",
 										content.GridW, content.GridH, content.Attempts, gerr)
