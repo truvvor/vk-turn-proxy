@@ -51,7 +51,46 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Detect bridgeable services on host
+        # Before doing any work decide whether this host actually has
+        # something for vk-turn-proxy to bridge. The matrix fans out
+        # across all three cluster runners, but only the hosts that
+        # already run WireGuard / Xray actually need a @udp/@vless
+        # instance. Runners without either (e.g. captcha-only nodes)
+        # soft-skip the rest of the job so the rollout doesn't go red
+        # over a host that has nothing to do.
+        id: detect
+        shell: bash
+        run: |
+          set -e
+          has_wg=false
+          if compgen -G "/etc/wireguard/*.conf" >/dev/null; then
+            has_wg=true
+          elif command -v wg >/dev/null 2>&1 && [ -n "$(sudo -n wg show 2>/dev/null)" ]; then
+            has_wg=true
+          fi
+          has_xray=false
+          for cand in /usr/local/etc/xray/config.json /etc/xray/config.json; do
+            if sudo -n test -r "$cand"; then
+              has_xray=true
+              break
+            fi
+          done
+          applicable=true
+          if [ "$has_wg" = "false" ] && [ "$has_xray" = "false" ]; then
+            applicable=false
+            echo "::notice::Neither WireGuard nor Xray detected on ${{ matrix.runner }} — skipping vk-turn-proxy deploy on this runner"
+          else
+            echo "host has: wg=$has_wg xray=$has_xray — proceeding with deploy"
+          fi
+          {
+            echo "has_wg=$has_wg"
+            echo "has_xray=$has_xray"
+            echo "applicable=$applicable"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Ensure HOME / GOCACHE are set
+        if: steps.detect.outputs.applicable == 'true'
         # Self-hosted runners that aren't started under a login shell can
         # arrive here with an empty $HOME, which makes `go env` and
         # actions/setup-go's cache step blow up. Fall back to RUNNER_TEMP.
@@ -63,12 +102,14 @@ jobs:
           fi
 
       - name: Set up Go
+        if: steps.detect.outputs.applicable == 'true'
         uses: actions/setup-go@v6
         with:
           go-version: '1.25.5'
           cache: true
 
       - name: Bootstrap host (idempotent)
+        if: steps.detect.outputs.applicable == 'true'
         # First-time setup: detect WireGuard / Xray, write env files,
         # enable systemd units. After the initial run install.sh leaves
         # existing /etc/vk-turn-proxy/*.env files alone, so this becomes
@@ -76,6 +117,7 @@ jobs:
         run: sudo -n bash ./scripts/bootstrap.sh
 
       - name: Inject WRAP_KEY into udp.env (if secret is set)
+        if: steps.detect.outputs.applicable == 'true' && steps.detect.outputs.has_wg == 'true'
         # The wrap shared key lives in repo secrets as WRAP_KEY so it
         # never lands in the public repo / Actions logs. When it's set,
         # we rewrite EXTRA_ARGS in /etc/vk-turn-proxy/udp.env to include
@@ -112,6 +154,7 @@ jobs:
           echo "udp.env EXTRA_ARGS updated to enable WRAP mode."
 
       - name: Build server binary
+        if: steps.detect.outputs.applicable == 'true'
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
@@ -120,11 +163,13 @@ jobs:
           ls -la dist/server
 
       - name: Deploy to host
+        if: steps.detect.outputs.applicable == 'true'
         # Pass an empty second arg so deploy.sh skips the captcha-service
         # binary swap; cluster workflow owns that now.
         run: ./scripts/deploy.sh dist/server ""
 
       - name: Verify enabled instances are active
+        if: steps.detect.outputs.applicable == 'true'
         id: verify
         run: |
           sleep 3
@@ -211,8 +256,19 @@ jobs:
           echo "::endgroup::"
           exit 1
 
+      - name: Skipped runner summary
+        if: success() && steps.detect.outputs.applicable != 'true'
+        env:
+          MY_RUNNER: ${{ matrix.runner }}
+        run: |
+          {
+            echo "## ${MY_RUNNER} — skipped"
+            echo ""
+            echo "Neither WireGuard nor Xray detected on this host, so no \`vk-turn-proxy@\` instance needs deploying here. This is expected for captcha-only nodes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Print connection URL
-        if: success()
+        if: success() && steps.detect.outputs.applicable == 'true'
         env:
           MY_RUNNER: ${{ matrix.runner }}
         run: |
