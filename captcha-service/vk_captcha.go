@@ -106,7 +106,7 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
 	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity ClientIdentity) (string, error) {
 	if manualCaptchaForcedMode() {
 		log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
 		return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
@@ -145,9 +145,15 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	}
 
 	profile := getRandomProfile()
+	if identity.UserAgent != "" {
+		// Honour the iOS client's UA across the Go-solver HTTP path so
+		// fetchPowInput / componentDone / check all advertise the same
+		// browser the success_token will later be redeemed on.
+		profile.UserAgent = identity.UserAgent
+	}
 	client := newCaptchaClient(forceDirect)
 
-	powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri)
+	powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri, identity)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
@@ -157,7 +163,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	hash := solvePoW(powInput, difficulty)
 	log.Printf("[Captcha] PoW solved: hash=%s", hash)
 
-	successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel)
+	successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel, identity)
 	if err == nil {
 		log.Printf("[Captcha] Success! Got success_token")
 		return successToken, nil
@@ -170,7 +176,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	// real and beats `BOT` verdicts that the plain-HTTP solver can't.
 	if headlessCaptchaEnabled {
 		log.Printf("[Captcha] go-solver failed (%v) — escalating to headless MITM solver", err)
-		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectUri, captchaProxyDialer())
+		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectUri, captchaProxyDialer(), identity)
 		if hErr == nil {
 			log.Printf("[Captcha] Success! Got success_token via headless")
 			return token, nil
@@ -181,7 +187,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 }
 
-func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
+func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string, identity ClientIdentity) (string, int, map[string]interface{}, error) {
 	req, err := fhttp.NewRequest("GET", redirectUri, nil)
 	if err != nil {
 		return "", 0, nil, err
@@ -197,6 +203,9 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Dest", "document")
+	if h := identity.CookieHeader(); h != "" {
+		req.Header.Set("Cookie", h)
+	}
 	applySafariHeaderOrder(req)
 
 	resp, err := client.Do(req)
@@ -271,7 +280,8 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool, identity ClientIdentity) (string, error) {
+	cookieHeader := identity.CookieHeader()
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
 
@@ -291,6 +301,9 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Priority", "u=1, i")
+		if cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
 		applySafariHeaderOrder(req)
 
 		httpResp, err := client.Do(req)
