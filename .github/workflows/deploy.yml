@@ -25,13 +25,6 @@ on:
       - 'scripts/deploy.sh'
       - '.github/workflows/deploy.yml'
 
-concurrency:
-  # Per-runner serialisation: re-pushing main shouldn't queue up
-  # multiple deploys to the same host, but parallel deploys across
-  # distinct runners are fine.
-  group: deploy-${{ github.ref }}-${{ matrix.runner }}
-  cancel-in-progress: false
-
 jobs:
   deploy:
     name: Build and deploy (${{ matrix.runner }})
@@ -45,6 +38,13 @@ jobs:
       matrix:
         runner: [ionos-us, ubuntu, ukoverheat]
     runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
+    # Per-runner serialisation: re-pushing main shouldn't queue up
+    # multiple deploys to the same host, but parallel deploys across
+    # distinct runners are fine. Concurrency lives at the job level
+    # because `matrix.runner` isn't in scope at the workflow level.
+    concurrency:
+      group: deploy-${{ github.ref }}-${{ matrix.runner }}
+      cancel-in-progress: false
     steps:
       - name: Check out code
         uses: actions/checkout@v6
