@@ -51,6 +51,55 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Provision WireGuard from secret (idempotent)
+        # When the operator stores a wg0.conf snapshot under the
+        # WG_SERVER_CONF repo secret, install it onto any host that
+        # doesn't already ship with WG. Existing /etc/wireguard/wg0.conf
+        # is NEVER overwritten — the step is a no-op on hosts that
+        # already run WG. This is what lets the matrix actually deploy
+        # vk-turn-proxy@udp across hosts that didn't ship with
+        # WireGuard pre-configured (e.g. the `ubuntu` runner).
+        #
+        # GH Actions masks `secrets.WG_SERVER_CONF` in logs automatically
+        # by value-substring match, so the printf below can't leak the
+        # key material even on accidental `set -x`. We additionally
+        # redirect tee to /dev/null so the conf body never reaches stdout.
+        env:
+          WG_CONF: ${{ secrets.WG_SERVER_CONF }}
+        shell: bash
+        run: |
+          set -e
+          if [ -z "${WG_CONF:-}" ]; then
+            echo "WG_SERVER_CONF secret not set — skipping WG provisioning"
+            exit 0
+          fi
+          if sudo -n test -f /etc/wireguard/wg0.conf; then
+            echo "/etc/wireguard/wg0.conf already exists — leaving it alone"
+            exit 0
+          fi
+          echo "Installing wireguard-tools + iptables..."
+          sudo -n DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wireguard-tools iptables
+          sudo -n install -d -m 0700 -o root -g root /etc/wireguard
+          # printf into tee preserves the secret bytes verbatim (no shell
+          # escape interpretation) and the redirect keeps stdout clean.
+          printf '%s\n' "$WG_CONF" | sudo -n tee /etc/wireguard/wg0.conf >/dev/null
+          sudo -n chmod 0600 /etc/wireguard/wg0.conf
+          sudo -n chown root:root /etc/wireguard/wg0.conf
+          # IP forwarding is required for any WG server that NATs / relays
+          # peer traffic. Idempotent: only append the sysctl line if it's
+          # not already there.
+          if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null; then
+            echo 'net.ipv4.ip_forward=1' | sudo -n tee -a /etc/sysctl.conf >/dev/null
+          fi
+          sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
+          sudo -n systemctl enable wg-quick@wg0
+          sudo -n systemctl start wg-quick@wg0
+          sleep 1
+          echo "WG status:"
+          sudo -n wg show
+
       - name: Detect bridgeable services on host
         # Before doing any work decide whether this host actually has
         # something for vk-turn-proxy to bridge. The matrix fans out
