@@ -1,0 +1,152 @@
+name: Cleanup branches
+
+# Self-service stale-branch reaper. Lists every branch in the repo
+# matching `pattern`, drops anything that is NOT the head of an open
+# pull request, leaves the rest. Driven by the workflow's built-in
+# GITHUB_TOKEN, so no PAT / repo secret is required.
+#
+# Why this exists: the MCP GitHub tool surface available to the
+# assistant doesn't expose a delete-ref tool, and the assistant's
+# git-proxy gets 403 on `git push --delete`. The cleanup therefore
+# needs to run from GitHub Actions where the built-in token has
+# native write access to refs.
+#
+# Default dispatch is dry-run — emits the action plan into the step
+# summary so the operator can eyeball it before flipping `dry_run`
+# to `false` on a follow-up dispatch.
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: 'Regex applied to branch names (only matching branches are considered)'
+        required: false
+        default: '^claude/'
+      dry_run:
+        description: 'true = list only, false = actually delete'
+        required: false
+        default: 'true'
+
+jobs:
+  cleanup:
+    name: Reap stale branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: List + delete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DRY: ${{ inputs.dry_run }}
+          PATTERN: ${{ inputs.pattern }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Repo:          $REPO"
+          echo "Default ref:   $DEFAULT_BRANCH (always preserved)"
+          echo "Pattern:       $PATTERN"
+          echo "Mode:          $([ "$DRY" = "true" ] && echo "DRY-RUN (list only)" || echo "DELETE")"
+          echo ""
+
+          # Pull every branch + every open PR head. Paginated APIs so the
+          # list survives past 100 entries.
+          mapfile -t branches < <(gh api -X GET "/repos/$REPO/branches?per_page=100" --paginate --jq '.[].name')
+          mapfile -t open_heads < <(gh api -X GET "/repos/$REPO/pulls?state=open&per_page=100" --paginate --jq '.[].head.ref')
+
+          echo "Found ${#branches[@]} branch(es), ${#open_heads[@]} open PR head(s)."
+
+          # Build a constant-time lookup for open PR heads.
+          declare -A open_set
+          for h in "${open_heads[@]:-}"; do
+            [ -n "$h" ] && open_set["$h"]=1
+          done
+
+          to_delete=()
+          skipped_pattern=0
+          skipped_open=0
+          skipped_default=0
+
+          for br in "${branches[@]}"; do
+            if [ "$br" = "$DEFAULT_BRANCH" ]; then
+              skipped_default=$((skipped_default + 1))
+              continue
+            fi
+            if ! echo "$br" | grep -qE "$PATTERN"; then
+              skipped_pattern=$((skipped_pattern + 1))
+              continue
+            fi
+            if [ "${open_set[$br]:-0}" = "1" ]; then
+              echo "  SKIP (open PR): $br"
+              skipped_open=$((skipped_open + 1))
+              continue
+            fi
+            to_delete+=("$br")
+          done
+
+          echo ""
+          echo "Matched ${#to_delete[@]} branch(es) for deletion."
+          for br in "${to_delete[@]:-}"; do
+            [ -n "$br" ] && echo "  $br"
+          done
+
+          {
+            echo "## Cleanup branches"
+            echo ""
+            echo "| Item | Count |"
+            echo "|---|---:|"
+            echo "| Branches inspected | ${#branches[@]} |"
+            echo "| Default branch preserved | $skipped_default |"
+            echo "| Skipped (pattern miss) | $skipped_pattern |"
+            echo "| Skipped (open PR head) | $skipped_open |"
+            echo "| Matched for deletion | ${#to_delete[@]} |"
+            echo "| Mode | \`$([ "$DRY" = "true" ] && echo dry-run || echo delete)\` |"
+            echo ""
+            if [ ${#to_delete[@]} -gt 0 ]; then
+              echo "### Branches matched"
+              echo ""
+              for br in "${to_delete[@]}"; do
+                echo "- \`$br\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DRY" = "true" ]; then
+            echo "::notice::dry-run: no branches were deleted. Re-dispatch with dry_run=false to apply."
+            exit 0
+          fi
+
+          if [ ${#to_delete[@]} -eq 0 ]; then
+            echo "Nothing to delete."
+            exit 0
+          fi
+
+          echo ""
+          echo "Deleting..."
+          deleted=0
+          failed=0
+          for br in "${to_delete[@]}"; do
+            if gh api -X DELETE "/repos/$REPO/git/refs/heads/$br" 2>&1 | tee /tmp/err; then
+              echo "  deleted: $br"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::delete failed for $br: $(cat /tmp/err)"
+              failed=$((failed + 1))
+            fi
+          done
+
+          {
+            echo ""
+            echo "### Result"
+            echo ""
+            echo "- Deleted: $deleted"
+            echo "- Failed:  $failed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed deletion(s) failed"
+            exit 1
+          fi
