@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,20 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bschaatsbergen/dnsdialer"
 )
 
 const captchaListenPort = "8765"
+
+// headlessSolveTimeout bounds how long we wait for the headless
+// browser to deliver a success_token before tearing down the session
+// and letting the caller retry. VK's checkbox path sometimes returns
+// status:ERROR (escalation) instead of a token; without a timeout we
+// would hang.
+const headlessSolveTimeout = 35 * time.Second
 
 var customCaptchaHost string
 
@@ -572,7 +581,7 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 }
 
 // runCaptchaServerAndWait triggers the browser, and waiting gracefully for the solution token.
-func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string) (string, error) {
+func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string, identity ClientIdentity) (string, error) {
 	srv := &http.Server{Handler: handler}
 
 	if err := startCaptchaServer(srv, logPrefix); err != nil {
@@ -586,10 +595,35 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	fmt.Println("==============================================")
 	fmt.Println()
 
-	log.Printf("[%s] Opening browser...", logPrefix)
-	openBrowser(captchaURL)
+	var captchaCleanup func()
+	if headlessCaptchaEnabled {
+		log.Printf("[%s] Launching headless Chromium...", logPrefix)
+		captchaCleanup = launchHeadlessCaptcha(captchaURL, identity)
+	} else {
+		log.Printf("[%s] Opening browser...", logPrefix)
+		openBrowser(captchaURL)
+		captchaCleanup = func() {}
+	}
+	defer captchaCleanup()
 
-	key := <-keyCh
+	// In headless mode the VK checkbox sometimes returns status:ERROR
+	// (escalation) instead of a success_token; the slider escalation can
+	// also stall. Cap the wait so the caller retries with a fresh
+	// session instead of blocking forever.
+	var key string
+	if headlessCaptchaEnabled {
+		select {
+		case key = <-keyCh:
+		case <-time.After(headlessSolveTimeout):
+			log.Printf("[%s] headless: no success_token within %s — retrying fresh session", logPrefix, headlessSolveTimeout)
+			shutCtx, sc := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(shutCtx)
+			sc()
+			return "", fmt.Errorf("headless captcha timeout")
+		}
+	} else {
+		key = <-keyCh
+	}
 
 	// Best-effort shutdown: the token is already received, so even if
 	// Shutdown times out (e.g. because ishConn.SetDeadline is a no-op
@@ -642,7 +676,7 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Done!</h2></body></html>`)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
+	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error", ClientIdentity{})
 }
 
 type loggingTransport struct {
@@ -698,12 +732,32 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return t.rt.RoundTrip(req)
 }
 
-func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
+func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity ClientIdentity) (string, error) {
 	keyCh := make(chan string, 1)
+	// Slider answer computed server-side from captchaNotRobot.getContent
+	// (see ModifyResponse below). When the headless browser swipes the
+	// thumb to trigger captchaNotRobot.check, the request body is
+	// rewritten to carry this answer — the browser only needs to fire
+	// the submit, the correct permutation is supplied by us.
+	var sliderMu sync.Mutex
+	var sliderAnswerB64 string
 
 	targetURL, err := neturl.Parse(redirectURI)
 	if err != nil {
 		return "", fmt.Errorf("invalid redirect URI: %v", err)
+	}
+
+	// Forward iOS-client UA + cookies on every outbound VK request so
+	// the success_token VK issues is bound to the same identity the
+	// client will use to redeem it. See client_identity.go.
+	cookieHeader := identity.CookieHeader()
+	applyIdentityHeaders := func(req *http.Request) {
+		if identity.UserAgent != "" {
+			req.Header.Set("User-Agent", identity.UserAgent)
+		}
+		if cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
 	}
 
 	transport := &loggingTransport{rt: newCaptchaProxyTransport(dialer)}
@@ -712,6 +766,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		Transport: transport,
 		Rewrite: func(req *httputil.ProxyRequest) {
 			rewriteProxyRequest(req.Out, targetURL)
+			applyIdentityHeaders(req.Out)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[Captcha Proxy] ERROR for %s %s: %v", r.Method, r.URL.String(), err)
@@ -827,6 +882,33 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 				req.Out.URL.Path = targetParsed.Path
 				req.Out.URL.RawQuery = targetParsed.RawQuery
 				rewriteProxyRequest(req.Out, targetParsed)
+				applyIdentityHeaders(req.Out)
+				// Inject the ranker-computed slider answer into the
+				// check request so the browser only needs to trigger
+				// the submit (via swipe) — the correct permutation is
+				// set here. See the captchaNotRobot.getContent branch
+				// in ModifyResponse below for where the answer is
+				// computed.
+				if strings.Contains(targetAuthURL, "captchaNotRobot.check") {
+					sliderMu.Lock()
+					ans := sliderAnswerB64
+					sliderMu.Unlock()
+					if ans != "" && req.Out.Body != nil {
+						if raw, rerr := io.ReadAll(req.Out.Body); rerr == nil {
+							_ = req.Out.Body.Close()
+							if vals, perr := neturl.ParseQuery(string(raw)); perr == nil {
+								vals.Set("answer", ans)
+								nb := vals.Encode()
+								req.Out.Body = io.NopCloser(strings.NewReader(nb))
+								req.Out.ContentLength = int64(len(nb))
+								req.Out.Header.Set("Content-Length", fmt.Sprint(len(nb)))
+								log.Printf("[Captcha Proxy] check: injected ranker answer (%d bytes)", len(ans))
+							} else {
+								req.Out.Body = io.NopCloser(bytes.NewReader(raw))
+							}
+						}
+					}
+				}
 			},
 			ModifyResponse: func(res *http.Response) error {
 				// Strip security headers that can block cross-origin resource loading
@@ -858,7 +940,49 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 						res.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 						res.ContentLength = int64(len(bodyBytes))
 						res.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
+						snip := string(bodyBytes)
+						if len(snip) > 600 {
+							snip = snip[:600]
+						}
+						log.Printf("[Captcha Proxy] check status=%d body=%s", res.StatusCode, snip)
 						notifyKey(keyCh, extractSuccessToken(bodyBytes))
+					}
+				}
+				// When VK escalates to the slider it serves
+				// captchaNotRobot.getContent (image + swap pairs).
+				// Snoop the response — let the body pass through
+				// unchanged so the browser still renders the slider —
+				// and compute the correct permutation via the local
+				// ranker. The answer is stored for the subsequent
+				// captchaNotRobot.check request to consume.
+				if strings.Contains(targetAuthURL, "captchaNotRobot.getContent") {
+					bodyBytes, readErr := io.ReadAll(res.Body)
+					if readErr == nil {
+						_ = res.Body.Close()
+						res.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+						res.ContentLength = int64(len(bodyBytes))
+						res.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
+						var raw map[string]interface{}
+						if jerr := json.Unmarshal(bodyBytes, &raw); jerr == nil {
+							if content, perr := parseSliderContent(raw); perr == nil {
+								if candidates, gerr := rankSliderCandidates(content.Image, content.GridW, content.GridH, content.Steps); gerr == nil && len(candidates) > 0 {
+									ansJSON, _ := json.Marshal(struct {
+										Value []int `json:"value"`
+									}{Value: candidates[0].ActiveSteps})
+									sliderMu.Lock()
+									sliderAnswerB64 = base64.StdEncoding.EncodeToString(ansJSON)
+									sliderMu.Unlock()
+									log.Printf("[Captcha Proxy] SLIDER ranker: grid=%dx%d attempts=%d candidates=%d -> answer ready (best idx=%d score=%d)",
+										content.GridW, content.GridH, content.Attempts,
+										len(candidates), candidates[0].Index, candidates[0].Score)
+								} else {
+									log.Printf("[Captcha Proxy] SLIDER getContent: grid=%dx%d attempts=%d (rank err=%v)",
+										content.GridW, content.GridH, content.Attempts, gerr)
+								}
+							} else {
+								log.Printf("[Captcha Proxy] SLIDER getContent parse err: %v", perr)
+							}
+						}
 					}
 				}
 
@@ -878,7 +1002,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		proxy.ServeHTTP(w, r)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error")
+	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error", identity)
 }
 
 func openBrowser(url string) {

@@ -41,6 +41,17 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// credRequest is the wire shape for both /cred and /internal/cred.
+// `user_agent` and `cookies` are optional — when present the captcha
+// solver (Go HTTP path AND headless Chromium path) mimics that
+// identity so VK sees one consistent browser across the solve and
+// the post-solve TURN-credential redemption. See client_identity.go.
+type credRequest struct {
+	Link      string         `json:"link"`
+	UserAgent string         `json:"user_agent,omitempty"`
+	Cookies   []ClientCookie `json:"cookies,omitempty"`
+}
+
 var (
 	apiKey     string
 	solveSlot  chan struct{}
@@ -133,9 +144,7 @@ func handleCred(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Link string `json:"link"`
-	}
+	var req credRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{fmt.Sprintf("bad body: %v", err)})
 		return
@@ -144,6 +153,7 @@ func handleCred(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{"link is required"})
 		return
 	}
+	identity := ClientIdentity{UserAgent: req.UserAgent, Cookies: req.Cookies}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 100*time.Second)
 	defer cancel()
@@ -162,9 +172,9 @@ func handleCred(w http.ResponseWriter, r *http.Request) {
 		var err error
 
 		if p.Self {
-			creds, saturated, err = solveLocally(ctx, req.Link)
+			creds, saturated, err = solveLocally(ctx, req.Link, identity)
 		} else {
-			creds, saturated, err = forwardToPeer(ctx, p, req.Link)
+			creds, saturated, err = forwardToPeer(ctx, p, req.Link, identity)
 		}
 
 		if saturated {
@@ -224,9 +234,7 @@ func handleInternalCred(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Link string `json:"link"`
-	}
+	var req credRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{fmt.Sprintf("bad body: %v", err)})
 		return
@@ -235,11 +243,12 @@ func handleInternalCred(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{"link is required"})
 		return
 	}
+	identity := ClientIdentity{UserAgent: req.UserAgent, Cookies: req.Cookies}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 80*time.Second)
 	defer cancel()
 
-	creds, saturated, err := solveLocally(ctx, req.Link)
+	creds, saturated, err := solveLocally(ctx, req.Link, identity)
 
 	if saturated {
 		w.Header().Set("X-Captcha-Self-Saturated", "1")
@@ -265,7 +274,7 @@ func handleInternalCred(w http.ResponseWriter, r *http.Request) {
 // to-peer leaf) and /cred when round-robin picks self. Returns
 // saturated=true when the solve hit ERROR_LIMIT so the master can
 // take this peer out of rotation for captchaCooldown.
-func solveLocally(ctx context.Context, link string) (*credResponse, bool, error) {
+func solveLocally(ctx context.Context, link string, identity ClientIdentity) (*credResponse, bool, error) {
 	if directSaturated() {
 		return nil, true, fmt.Errorf("egress saturated, retry after cooldown")
 	}
@@ -277,7 +286,7 @@ func solveLocally(ctx context.Context, link string) (*credResponse, bool, error)
 	}
 	defer func() { <-solveSlot }()
 
-	user, pass, addr, err := getCreds(ctx, link)
+	user, pass, addr, err := getCreds(ctx, link, identity)
 	if err != nil {
 		// directSaturated() flips during the captcha pipeline when
 		// VK returns ERROR_LIMIT — re-check after so the caller can

@@ -26,17 +26,25 @@ on:
       - '.github/workflows/deploy.yml'
 
 concurrency:
-  group: deploy-${{ github.ref }}
+  # Per-runner serialisation: re-pushing main shouldn't queue up
+  # multiple deploys to the same host, but parallel deploys across
+  # distinct runners are fine.
+  group: deploy-${{ github.ref }}-${{ matrix.runner }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Build and deploy on self-hosted runner
-    # Pinned to the `ionos-us` runner: this workflow only owns the
-    # vk-turn-proxy@udp/@vless units, which run alongside wg-quick@wg0
-    # and xray on us.overheat.cn. captcha-service is now deployed by
-    # deploy-cluster.yml across multiple runners.
-    runs-on: [self-hosted, linux, x64, ionos-us]
+    name: Build and deploy (${{ matrix.runner }})
+    # Roll vk-turn-proxy@udp/@vless to every cluster runner so WRAP
+    # (and any future server-side change) lands everywhere. bootstrap.sh
+    # detects WireGuard / Xray presence per-host and skips what isn't
+    # there, so a runner without WG just gets no @udp unit enabled and
+    # the verify step soft-skips it.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ionos-us, ubuntu, ukoverheat]
+    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
     steps:
       - name: Check out code
         uses: actions/checkout@v6
@@ -205,10 +213,12 @@ jobs:
 
       - name: Print connection URL
         if: success()
+        env:
+          MY_RUNNER: ${{ matrix.runner }}
         run: |
           PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo '<server-ip>')"
           {
-            echo "## Active vk-turn-proxy endpoints"
+            echo "## ${MY_RUNNER} — active vk-turn-proxy endpoints (\`${PUBLIC_IP}\`)"
             echo ""
             for instance in udp vless; do
               unit="vk-turn-proxy@${instance}.service"

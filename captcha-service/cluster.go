@@ -161,8 +161,12 @@ func pickPeer(triedMask []bool) *peer {
 // so the master can mark the peer for cooldown. On other errors the
 // returned saturated=false leaves the peer in rotation (transient
 // failures shouldn't ban the peer for 60 s).
-func forwardToPeer(ctx context.Context, p *peer, link string) (*credResponse, bool, error) {
-	body, _ := json.Marshal(map[string]string{"link": link})
+func forwardToPeer(ctx context.Context, p *peer, link string, identity ClientIdentity) (*credResponse, bool, error) {
+	body, _ := json.Marshal(credRequest{
+		Link:      link,
+		UserAgent: identity.UserAgent,
+		Cookies:   identity.Cookies,
+	})
 	req, err := http.NewRequestWithContext(ctx, "POST", p.URL+"/internal/cred", bytes.NewReader(body))
 	if err != nil {
 		return nil, false, fmt.Errorf("build request: %w", err)

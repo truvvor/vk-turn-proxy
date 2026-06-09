@@ -22,7 +22,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type getCredsFunc func(context.Context, string) (string, string, string, error)
+type getCredsFunc func(context.Context, string, ClientIdentity) (string, string, string, error)
 
 // sharedAuthClient — package-level so the connection pool spans the
 // whole server lifetime. See F4 in the iOS-side commit history.
@@ -39,12 +39,19 @@ var sharedAuthClient = &http.Client{
 	},
 }
 
-func getCreds(ctx context.Context, link string) (resUser string, resPass string, resTurn string, resErr error) {
+func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUser string, resPass string, resTurn string, resErr error) {
 	profile := getRandomProfile()
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
 
-	log.Printf("Connecting - Name: %s | UA: %s", name, profile.UserAgent)
+	effectiveUA := profile.UserAgent
+	if identity.UserAgent != "" {
+		effectiveUA = identity.UserAgent
+	}
+	cookieHeader := identity.CookieHeader()
+
+	log.Printf("Connecting - Name: %s | UA: %s | client-identity=%v",
+		name, effectiveUA, !identity.Empty())
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
@@ -52,8 +59,11 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 			return nil, err
 		}
 
-		req.Header.Add("User-Agent", profile.UserAgent)
+		req.Header.Add("User-Agent", effectiveUA)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		if cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
 
 		httpResp, err := sharedAuthClient.Do(req)
 		if err != nil {
@@ -118,7 +128,7 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 				if captchaErr.IsCaptchaError() {
 					log.Printf("[Captcha] Attempt %d/%d: solving...", attempt+1, maxCaptchaAttempts)
 
-					successToken, solveErr := solveVkCaptcha(ctx, captchaErr)
+					successToken, solveErr := solveVkCaptcha(ctx, captchaErr, identity)
 					if solveErr != nil {
 						return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
 					}
