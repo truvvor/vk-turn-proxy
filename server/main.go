@@ -113,7 +113,7 @@ func main() {
 
 	var listener net.Listener
 	if *wrapMode {
-		log.Printf("WRAP mode enabled: listener only accepts clients with matching -wrap-key")
+		log.Printf("WRAP mode enabled: per-allocation auto-detect — WRAP clients use SRTP-shaped frames, legacy DTLS-only clients still work (sniff first datagram for 0x80 0x6F)")
 		wrapListener, werr := listenWrapped(addr, wrapKey)
 		if werr != nil {
 			panic(werr)

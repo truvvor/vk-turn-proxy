@@ -103,6 +103,36 @@ func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
 func (l *wrapPacketListener) Close() error   { return l.inner.Close() }
 func (l *wrapPacketListener) Addr() net.Addr { return l.inner.Addr() }
 
+// connMode is decided after the conn's first inbound packet:
+//
+//	modeDetecting — no inbound packet yet; outbound writes default to wrap
+//	                (key is set, expectation is the client speaks WRAP).
+//	modeWrap      — first packet was 0x80 0x6F-shaped and AEAD-opened OK,
+//	                so this allocation is a WRAP client. All subsequent
+//	                reads AEAD-decrypt, all writes wrap-encrypt.
+//	modePlain     — first packet was NOT 0x80 0x6F-shaped (legacy
+//	                DTLS-over-TURN client). Reads pass through, writes
+//	                bypass AEAD.
+//
+// Spec: SERVER_COMPAT.md §1 "Config surface on the server" — the server
+// should auto-detect from the first datagram per allocation so an
+// operator can roll wrap onto the server without coordinating a sharp
+// cutover on the client. Mixing wrapped + legacy allocations is OK; one
+// allocation is locked to one mode after its first packet.
+type connMode uint32
+
+const (
+	modeDetecting connMode = iota
+	modeWrap
+	modePlain
+)
+
+// maxConsecutiveAEADFails caps how many consecutive AEAD-open errors we
+// tolerate on a wrap-mode allocation before tearing it down. Spec
+// recommends ~100 — almost always indicates a key mismatch by that
+// point.
+const maxConsecutiveAEADFails = 100
+
 type wrapPacketConn struct {
 	inner     net.PacketConn
 	ws        *wrapState
@@ -111,45 +141,106 @@ type wrapPacketConn struct {
 	counter   atomic.Uint64
 	seq       atomic.Uint32
 	timestamp atomic.Uint32
+
+	mode      atomic.Uint32 // connMode; locked after first inbound packet
+	aeadFails atomic.Uint32 // consecutive AEAD-open failures in wrap mode
+}
+
+// looksLikeWrap is the cheap 2-byte sniff from SERVER_COMPAT.md §1.
+// A real WRAP frame always starts with the (V=2, PT=Opus) RTP byte pair.
+// Anything else — DTLS handshake records start with 0x16, app-data
+// with 0x17, etc. — is a legacy plain client.
+func looksLikeWrap(wire []byte) bool {
+	return len(wire) >= wrapOverhead &&
+		wire[0] == wrapRTPVersion &&
+		wire[1] == wrapRTPPT
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	bp, ok := bufPool.Get().(*[]byte)
-	if !ok {
-		return 0, nil, errors.New("wrap: buffer pool returned invalid type")
-	}
-	buf := *bp
-	need := len(p) + wrapOverhead
-	if cap(buf) < need {
-		buf = make([]byte, need)
-		*bp = buf
-	}
-	defer bufPool.Put(bp)
+	for {
+		bp, ok := bufPool.Get().(*[]byte)
+		if !ok {
+			return 0, nil, errors.New("wrap: buffer pool returned invalid type")
+		}
+		buf := *bp
+		need := len(p) + wrapOverhead
+		if cap(buf) < need {
+			buf = make([]byte, need)
+			*bp = buf
+		}
 
-	n, addr, err := c.inner.ReadFrom(buf[:cap(buf)])
-	if err != nil {
-		return 0, addr, err
-	}
-	wire := buf[:n]
-	if len(wire) < wrapOverhead {
-		return 0, addr, errors.New("wrap: packet too short")
-	}
-	nonce := wire[wrapRTPHdrLen : wrapRTPHdrLen+wrapNonceLen]
-	aad := wire[:wrapHeaderLen]
-	ct := wire[wrapHeaderLen:]
+		n, addr, err := c.inner.ReadFrom(buf[:cap(buf)])
+		if err != nil {
+			bufPool.Put(bp)
+			return 0, addr, err
+		}
+		wire := buf[:n]
 
-	plain, err := c.ws.aead.Open(ct[:0], nonce, ct, aad)
-	if err != nil {
-		return 0, addr, fmt.Errorf("wrap: AEAD open: %w", err)
+		// First packet decides the mode for the lifetime of this conn.
+		if connMode(c.mode.Load()) == modeDetecting {
+			if looksLikeWrap(wire) {
+				c.mode.Store(uint32(modeWrap))
+			} else {
+				c.mode.Store(uint32(modePlain))
+			}
+		}
+
+		switch connMode(c.mode.Load()) {
+		case modePlain:
+			if len(wire) > len(p) {
+				bufPool.Put(bp)
+				return 0, addr, errors.New("wrap: dst buffer too small")
+			}
+			copy(p[:len(wire)], wire)
+			bufPool.Put(bp)
+			return len(wire), addr, nil
+
+		case modeWrap:
+			if !looksLikeWrap(wire) {
+				// Stray plain packet mid-wrap-session (e.g. retransmit
+				// from before the client enabled wrap, or a non-WRAP
+				// peer hitting the same allocation). Drop and continue.
+				bufPool.Put(bp)
+				if c.aeadFails.Add(1) > maxConsecutiveAEADFails {
+					return 0, addr, errors.New("wrap: too many non-wrap packets after lock")
+				}
+				continue
+			}
+			nonce := wire[wrapRTPHdrLen : wrapRTPHdrLen+wrapNonceLen]
+			aad := wire[:wrapHeaderLen]
+			ct := wire[wrapHeaderLen:]
+			plain, err := c.ws.aead.Open(ct[:0], nonce, ct, aad)
+			if err != nil {
+				// Per spec: "drop the packet, do not tear down". Loop
+				// and read the next packet from the wire. After
+				// maxConsecutiveAEADFails the conn is almost certainly
+				// keyed against a different operator — give up.
+				bufPool.Put(bp)
+				if c.aeadFails.Add(1) > maxConsecutiveAEADFails {
+					return 0, addr, fmt.Errorf("wrap: AEAD failure threshold (%d) hit; key mismatch?", maxConsecutiveAEADFails)
+				}
+				continue
+			}
+			c.aeadFails.Store(0)
+			if len(plain) > len(p) {
+				bufPool.Put(bp)
+				return 0, addr, errors.New("wrap: dst buffer too small")
+			}
+			copy(p[:len(plain)], plain)
+			bufPool.Put(bp)
+			return len(plain), addr, nil
+		}
 	}
-	if len(plain) > len(p) {
-		return 0, addr, errors.New("wrap: dst buffer too small")
-	}
-	copy(p[:len(plain)], plain)
-	return len(plain), addr, nil
 }
 
 func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	// In plain mode (locked by the first inbound packet), DON'T touch
+	// the wire bytes — legacy clients expect their DTLS records to
+	// arrive byte-for-byte, no RTP veneer.
+	if connMode(c.mode.Load()) == modePlain {
+		return c.inner.WriteTo(p, addr)
+	}
+
 	wireLen := wrapOverhead + len(p)
 
 	bp, ok := bufPool.Get().(*[]byte)
