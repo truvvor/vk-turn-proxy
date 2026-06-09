@@ -103,6 +103,23 @@ jobs:
           sudo mv -f /opt/vk-turn-proxy/captcha-service.new /opt/vk-turn-proxy/captcha-service
           sudo systemctl daemon-reload
 
+      - name: Install chrome-headless-shell (idempotent)
+        # Required by captcha-service's headless BOT-fallback path
+        # (HEADLESS_CAPTCHA=1, see configure job). The install script
+        # apt-installs Chromium's runtime libs and drops chrome-
+        # headless-shell at /usr/local/bin/chrome-headless-shell.
+        # Skips entirely if the binary is already present and runnable
+        # — re-runs on a healthy node are a 1-second no-op.
+        run: |
+          set -e
+          if [ -x /usr/local/bin/chrome-headless-shell ] \
+              && /usr/local/bin/chrome-headless-shell --version >/dev/null 2>&1; then
+            echo "chrome-headless-shell already installed: $(/usr/local/bin/chrome-headless-shell --version)"
+            exit 0
+          fi
+          echo "Installing chrome-headless-shell on ${{ matrix.runner }}..."
+          sudo bash scripts/install-chrome-headless-shell.sh
+
       - name: Detect public IP and export to artifact
         id: ip
         run: |
@@ -182,12 +199,17 @@ jobs:
 
           # Write the env file via a temp + mv so an in-flight read on
           # the running unit doesn't see a half-written file.
+          # HEADLESS_CAPTCHA=1 + CHROMIUM_PATH activate the chrome-
+          # headless-shell BOT-fallback path that the install job above
+          # provisioned. captcha-service.go reads both at startup.
           tmp=$(mktemp)
           cat > "$tmp" <<EOF
           LISTEN_ADDR=:${PORT}
           API_KEY=${API_KEY}
           PEERS=${PEERS}
           SELF_URL=${SELF_URL}
+          HEADLESS_CAPTCHA=1
+          CHROMIUM_PATH=/usr/local/bin/chrome-headless-shell
           EOF
           sudo install -m 0640 -o root -g root "$tmp" /etc/vk-turn-proxy/captcha-service.env
           rm -f "$tmp"

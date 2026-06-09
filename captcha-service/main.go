@@ -58,8 +58,21 @@ func main() {
 		log.Fatal("API_KEY env var is required")
 	}
 	solveSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
-	initOutboundBindIP()
 	initPeers()
+
+	// Headless captcha fallback: opt-in via env. When on, vk_captcha.go
+	// escalates from the fast Go solver to chromedp-driven Chromium if
+	// the Go path can't recover from VK's BOT verdict. Requires
+	// chrome-headless-shell (or any chromium binary) on PATH or via
+	// CHROMIUM_PATH override. See deploy/install-chrome-headless-shell.sh.
+	if v := os.Getenv("HEADLESS_CAPTCHA"); v == "1" || v == "true" {
+		headlessCaptchaEnabled = true
+		log.Printf("captcha: headless escalation ENABLED (HEADLESS_CAPTCHA=%q)", v)
+	}
+	if p := os.Getenv("CHROMIUM_PATH"); p != "" {
+		chromiumPathOverride = p
+		log.Printf("captcha: chromium override CHROMIUM_PATH=%q", p)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cred", handleCred)
@@ -79,7 +92,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("captcha-service listening on %s (max concurrent solves=%d)", addr, maxConcurrentCaptchaSolves)
+	log.Printf("captcha-service listening on %s (max concurrent solves=%d, WARP=%s)", addr, maxConcurrentCaptchaSolves, warpStatus())
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("ListenAndServe: %v", err)
 	}
@@ -318,8 +331,8 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		CredsErrors   int64      `json:"creds_errors"`
 		SaturatedNow  bool       `json:"saturated_now"`
 		UptimeSeconds int64      `json:"uptime_seconds"`
+		WARP          string     `json:"warp"`
 		Peers         []peerStat `json:"peers"`
-		OutboundPool  []string   `json:"outbound_pool"`
 	}{
 		Attempts:      stats.attempts,
 		Successes:     stats.successes,
@@ -329,8 +342,8 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		CredsErrors:   credsErrs.Load(),
 		SaturatedNow:  directSaturated(),
 		UptimeSeconds: int64(time.Since(startedAt).Seconds()),
+		WARP:          warpStatus(),
 		Peers:         peerStats,
-		OutboundPool:  outboundPoolSnapshot(),
 	}
 	stats.mu.Unlock()
 	writeJSON(w, http.StatusOK, snap)
