@@ -28,10 +28,19 @@ PrivateTmp=true
 PrivateDevices=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
-RestrictNamespaces=true
+# chromedp / chrome-headless-shell needs:
+#   - CLONE_NEWUSER for the renderer zygote even with --no-sandbox
+#     (chromium always creates a user-namespace child process to host
+#     the renderer; without it the headless solver dies at startup).
+#   - AF_UNIX socketpairs for browser↔renderer Mojo IPC.
+# Without these the HEADLESS_CAPTCHA=1 path can't initialise and every
+# BOT-fallback solve fails before even loading the captcha page —
+# /cred just returns 502 / times out, which is what the cluster does
+# right now when the iOS app shows "0/3 Server" stuck on "Please wait".
+RestrictNamespaces=user
 LockPersonality=true
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitNOFILE=65536

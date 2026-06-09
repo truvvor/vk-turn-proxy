@@ -84,6 +84,11 @@ func launchHeadlessCaptcha(url string, identity ClientIdentity) func() {
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-background-networking", true),
 		chromedp.Flag("mute-audio", true),
+		// --no-zygote keeps Chromium from spawning a zygote helper
+		// process; combined with --no-sandbox above it removes the
+		// CLONE_NEWUSER dance entirely and lets the headless solver
+		// start cleanly under systemd's sandbox.
+		chromedp.Flag("no-zygote", true),
 	)
 	if identity.UserAgent != "" {
 		// Browser-process flag so the request that loads the very first
