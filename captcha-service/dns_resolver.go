@@ -25,10 +25,6 @@
 // passes the request URL host as SNI/ServerName regardless of what
 // DialContext returned), so dialing to a raw IP doesn't break cert
 // verification.
-//
-// Source-IP selection lives in outbound.go (outboundDialer) — see
-// there for the rotation pool. Every dialer in this file goes through
-// outboundDialer so each new connection lands on the next pool IP.
 
 package main
 
@@ -54,16 +50,14 @@ const (
 )
 
 // dohClient is used ONLY for the DoH lookup itself. Plain net.Dialer
-// so we don't recurse into customDial. DialContext is a closure rather
-// than a bound method so it reads outboundBindIP at request time, not
-// at package-init time (init order: vars → init() → main, but
-// OUTBOUND_BIND_IP is parsed in main).
+// (no recursion into customDial), with the WARP control hook so DoH
+// queries to 1.1.1.1 also egress via the WARP interface when
+// WARP_INTERFACE is set. Cloudflare's 1.1.1.1 is reachable from inside
+// WARP just fine.
 var dohClient = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return outboundDialer(4*time.Second).DialContext(ctx, network, address)
-		},
+		DialContext:     (&net.Dialer{Timeout: 4 * time.Second, Control: warpControl}).DialContext,
 		TLSClientConfig: &tls.Config{},
 	},
 }
@@ -101,12 +95,14 @@ func customDial(ctx context.Context, network, address string) (net.Conn, error) 
 	}
 
 	// Fast path: literal IP needs no resolution.
+	// Control hook pins the socket to WARP_INTERFACE when set; no-op
+	// otherwise. See warp_dialer.go.
 	if net.ParseIP(host) != nil {
-		return outboundDialer(8*time.Second).DialContext(ctx, network, address)
+		return (&net.Dialer{Timeout: 8 * time.Second, Control: warpControl}).DialContext(ctx, network, address)
 	}
 
-	// Layer 1: system resolver.
-	d := outboundDialer(dohDialBudget)
+	// Layer 1: system resolver. WARP-pinned via Control hook.
+	d := &net.Dialer{Timeout: dohDialBudget, Control: warpControl}
 	sysCtx, cancel := context.WithTimeout(ctx, systemDialBudget)
 	conn, sysErr := d.DialContext(sysCtx, network, address)
 	cancel()

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,13 +11,14 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
-	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tlsclient "github.com/bogdanfinn/tls-client"
 )
 
 type VkCaptchaError struct {
@@ -43,34 +43,18 @@ func randomHex(n int) string {
 	return hex.EncodeToString(bytes)
 }
 
-func newCaptchaClient(forceDirect bool) *http.Client {
-	jar, _ := cookiejar.New(nil)
-	dialer := customDial
-	if forceDirect {
-		// After WG comes up the extension's default route is utun, so
-		// every captcha HTTP normally goes through the tunnel egress.
-		// When the tunnel egress has hit VK's per-IP rate-limit we
-		// want to retry from the original physical egress (cellular /
-		// WiFi). cellularDial pins the socket to a non-utun interface
-		// index via IP_BOUND_IF so the kernel routes through the
-		// physical NIC instead of utun.
-		dialer = cellularDial
+// newCaptchaClient now returns a TLS-fingerprinted client (Safari iOS
+// 18) that also pins outbound sockets to the WARP WireGuard interface
+// when WARP_INTERFACE is set. See captcha_client.go and warp_dialer.go.
+// forceDirect kept in the signature for callsite compat but ignored:
+// the iOS-side meaning (bypass utun for tunnel-egress rate-limit) has
+// no analog on a Linux server.
+func newCaptchaClient(_ bool) tlsclient.HttpClient {
+	c, err := newTLSCaptchaClient()
+	if err != nil {
+		panic(fmt.Sprintf("newTLSCaptchaClient: %v", err))
 	}
-	return &http.Client{
-		Timeout: 20 * time.Second,
-		Jar:     jar,
-		Transport: &http.Transport{
-			// customDial layers system DNS → DoH (1.1.1.1) → hardcoded
-			// VK IPs. Russian mobile carriers regularly return NXDOMAIN
-			// or hijacked records for api.vk.ru / id.vk.ru, which
-			// bricks the captcha solver before any other retry can
-			// engage. See dns_resolver.go.
-			DialContext: dialer,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: false,
-			},
-		},
-	}
+	return c
 }
 
 func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
@@ -182,28 +166,23 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, client *http.Client, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
+func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
+	req, err := fhttp.NewRequest("GET", redirectUri, nil)
 	if err != nil {
 		return "", 0, nil, err
 	}
+	req = withCaptchaCtx(ctx, req)
 
 	req.Header.Set("User-Agent", profile.UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	// Safari deliberately doesn't implement Client Hints — sending
-	// these headers from a Safari UA is itself a bot tell. Skip them
-	// when the profile didn't define any.
-	if profile.SecChUa != "" {
-		req.Header.Set("sec-ch-ua", profile.SecChUa)
-		req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-		req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
-	}
+	// Safari iOS doesn't implement Client Hints. With Safari_IOS_18_0
+	// fingerprint we mirror real Safari at every layer, so drop
+	// sec-ch-ua* unconditionally.
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-GPC", "1")
-	req.Header.Set("DNT", "1")
+	applySafariHeaderOrder(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -249,6 +228,16 @@ func fetchPowInput(ctx context.Context, client *http.Client, profile Profile, re
 		}
 	}
 
+	// Stash not_robot_captcha.js URL so the caller can fetch debug_info
+	// dynamically. See captcha_debug_info.go.
+	scriptURL := extractScriptURL(html)
+	if scriptURL != "" {
+		if htmlSettings == nil {
+			htmlSettings = map[string]interface{}{}
+		}
+		htmlSettings["_scriptURL"] = scriptURL
+	}
+
 	return powInput, difficulty, htmlSettings, nil
 }
 
@@ -267,14 +256,15 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
 
-		req, err := http.NewRequestWithContext(ctx, "POST", requestURL, strings.NewReader(postData))
+		req, err := fhttp.NewRequest("POST", requestURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
+		req = withCaptchaCtx(ctx, req)
 
 		req.Header.Set("User-Agent", profile.UserAgent)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -282,17 +272,11 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		req.Header.Set("Origin", "https://id.vk.com")
 		req.Header.Set("Referer", "https://id.vk.com/")
-		if profile.SecChUa != "" {
-			req.Header.Set("sec-ch-ua", profile.SecChUa)
-			req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-			req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
-		}
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-GPC", "1")
-		req.Header.Set("DNT", "1")
 		req.Header.Set("Priority", "u=1, i")
+		applySafariHeaderOrder(req)
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -328,34 +312,27 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 	// Step 2: componentDone
 	log.Printf("[Captcha] Step 2/4: componentDone")
 
-	browserFp := fmt.Sprintf("%016x%016x", mathrand.Int63(), mathrand.Int63())
+	// crypto/rand-backed 32-hex-char browser fingerprint (v2).
+	browserFp := randomHex(16)
 
-	resolutions := [][]int{{1920, 1080}, {1366, 768}, {1440, 900}, {1536, 864}, {2560, 1440}}
-	res := resolutions[mathrand.Intn(len(resolutions))]
-	screenW, screenH := res[0], res[1]
-
-	cores := []int{4, 8, 12, 16}[mathrand.Intn(4)]
-	ram := []int{4, 8, 16, 32}[mathrand.Intn(4)]
-
-	baseDownlink := 8.0 + mathrand.Float64()*4.0
-	downlinkStr := fmt.Sprintf("%.1f", baseDownlink)
-
+	// v2 device shape: fixed desktop Chrome 8-core/1080p. See iOS-side
+	// captcha-vk for full rationale.
+	const (
+		screenW = 1920
+		screenH = 1080
+	)
 	deviceMap := map[string]interface{}{
 		"screenWidth":             screenW,
 		"screenHeight":            screenH,
 		"screenAvailWidth":        screenW,
-		"screenAvailHeight":       screenH - 40,
-		"innerWidth":              screenW - mathrand.Intn(100),
-		"innerHeight":             screenH - 100 - mathrand.Intn(50),
-		"devicePixelRatio":        []float64{1, 1.25, 1.5, 2}[mathrand.Intn(4)],
+		"screenAvailHeight":       screenH,
+		"innerWidth":              screenW,
+		"innerHeight":             951,
+		"devicePixelRatio":        1,
 		"language":                "en-US",
 		"languages":               []string{"en-US", "en"},
 		"webdriver":               false,
-		"hardwareConcurrency":     cores,
-		"deviceMemory":            ram,
-		"connectionEffectiveType": "4g",
-		"connectionRtt":           []int{50, 100, 150}[mathrand.Intn(3)],
-		"connectionDownlink":      baseDownlink,
+		"hardwareConcurrency":     8,
 		"notificationsPermission": "denied",
 	}
 	deviceBytes, _ := json.Marshal(deviceMap)
@@ -393,11 +370,19 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 	}
 	cursorBytes, _ := json.Marshal(cursor)
 
-	connectionDownlink := "[" + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "]"
-
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
-	debugInfo := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+	// Dynamic debug_info from not_robot_captcha.js. See iOS-side
+	// captcha_debug_info.go for the rationale; fallback to legacy
+	// constant when fetch fails.
+	scriptURL, _ := htmlSettings["_scriptURL"].(string)
+	debugInfo, debugErr := fetchDebugInfo(ctx, client, profile, scriptURL)
+	if debugErr != nil {
+		log.Printf("[Captcha] fetchDebugInfo: %v — using legacy constant", debugErr)
+		debugInfo = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	}
+
+	// v2 wire shape: all motion arrays empty including connectionDownlink.
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
 			"&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -407,7 +392,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 		url.QueryEscape(string(cursorBytes)),
 		url.QueryEscape("[]"),
 		url.QueryEscape("[]"),
-		url.QueryEscape(connectionDownlink),
+		url.QueryEscape("[]"),
 		browserFp,
 		hash,
 		answer,
@@ -425,7 +410,8 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 	}
 
 	status, _ := respObj["status"].(string)
-	log.Printf("[Captcha] checkbox status: %s", status)
+	showType, _ := respObj["show_captcha_type"].(string)
+	log.Printf("[Captcha] checkbox status: %s show_type=%q", status, showType)
 
 	if status == "OK" {
 		successToken, ok := respObj["success_token"].(string)
@@ -438,17 +424,17 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 	}
 
 	if status == "ERROR_LIMIT" {
-		// Mark the egress that owns this request as saturated. The
-		// bootstrap fleet runs from the client IP (saturates direct);
-		// the deferred fleet runs after WG handshake completes so its
-		// HTTP routes through utun and saturates the tunnel egress.
-		// StartProxy reads these flags to stop spawning new sessions
-		// when the second pool is also dry.
 		markCaptchaSaturated(isTunnel)
+		return "", fmt.Errorf("captchaNotRobot.check ERROR_LIMIT (no slider fallback under rate-limit)")
 	}
 
-	// Checkbox failed — try slider captcha
-	log.Printf("[Captcha] Checkbox failed, trying slider captcha...")
+	// v2 routing: only try slider on explicit BOT status with slider show_type.
+	sliderEligible := status == "BOT" && (showType == "" || showType == "slider")
+	if !sliderEligible {
+		return "", fmt.Errorf("captchaNotRobot.check non-OK status=%q show_type=%q", status, showType)
+	}
+
+	log.Printf("[Captcha] Checkbox status=BOT show_type=%q, switching to slider", showType)
 
 	// Use htmlSettings from the HTML page if available, otherwise use API settings
 	mergedSettings := settingsResp
@@ -456,7 +442,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 		mergedSettings = htmlSettings
 	}
 
-	sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings, isTunnel)
+	sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, debugInfo, mergedSettings, isTunnel)
 	if sliderErr != nil {
 		// saturation accounting now happens inside solveSliderCaptcha
 		// at the exact branch (ERROR_LIMIT or unparseable_response),

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +22,18 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// isDebug toggles noisy per-packet logs in wrap.go / udp_listener.go.
+// Set from -debug at startup.
+var isDebug bool
+
+// debugf is the gated logger used by udp_listener.go / wrap.go. No-op
+// unless -debug is on.
+func debugf(format string, v ...any) {
+	if isDebug {
+		log.Printf(format, v...)
+	}
+}
+
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
@@ -28,7 +42,23 @@ func main() {
 		"When enabled, each DTLS stream MUST send a 16-byte session ID immediately after the handshake. "+
 		"Replies from the backend are round-robined across the streams that share the ID. "+
 		"WIRE-INCOMPATIBLE with non-aggregating clients — turn this on only when every client speaks the protocol.")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-like AEAD obfuscation for DTLS packets before they reach TURN ChannelData. "+
+		"Every packet is wrapped with a fake RTP header (PT=Opus, monotonic seq/ts/SSRC) + ChaCha20-Poly1305 AEAD. "+
+		"WIRE-INCOMPATIBLE with non-wrapping clients — both sides must run with -wrap and a matching -wrap-key.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
+	debugFlag := flag.Bool("debug", false, "enable debug logging (per-packet WRAP / UDP listener traces)")
 	flag.Parse()
+	isDebug = *debugFlag
+
+	if *genWrapKey {
+		key := make([]byte, wrapKeyLen)
+		if _, err := rand.Read(key); err != nil {
+			log.Panicf("gen-wrap-key: rand.Read: %v", err)
+		}
+		fmt.Println(hex.EncodeToString(key))
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,6 +79,21 @@ func main() {
 	if len(*connect) == 0 {
 		log.Panicf("server address is required")
 	}
+
+	var wrapKey []byte
+	if *wrapMode {
+		if *wrapKeyHex == "" {
+			log.Panicf("-wrap requires -wrap-key")
+		}
+		wrapKey, err = hex.DecodeString(*wrapKeyHex)
+		if err != nil {
+			log.Panicf("-wrap-key invalid hex: %v", err)
+		}
+		if len(wrapKey) != wrapKeyLen {
+			log.Panicf("-wrap-key must decode to %d bytes (got %d)", wrapKeyLen, len(wrapKey))
+		}
+	}
+
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
@@ -59,15 +104,28 @@ func main() {
 	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
 	//
 
-	// Connect to a DTLS server
-	listener, err := dtls.ListenWithOptions(
-		"udp",
-		addr,
+	dtlsOpts := []dtls.ServerOption{
 		dtls.WithCertificates(certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
-	)
+	}
+
+	var listener net.Listener
+	if *wrapMode {
+		log.Printf("WRAP mode enabled: listener only accepts clients with matching -wrap-key")
+		wrapListener, werr := listenWrapped(addr, wrapKey)
+		if werr != nil {
+			panic(werr)
+		}
+		listener, err = dtls.NewListenerWithOptions(wrapListener, dtlsOpts...)
+	} else {
+		udpListener, lerr := listenUDPForDTLS(addr)
+		if lerr != nil {
+			panic(lerr)
+		}
+		listener, err = dtls.NewListenerWithOptions(udpListener, dtlsOpts...)
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -77,9 +135,14 @@ func main() {
 		}
 	})
 
-	if *aggregate {
+	switch {
+	case *aggregate && *wrapMode:
+		fmt.Println("Listening (WRAP + aggregate mode)")
+	case *wrapMode:
+		fmt.Println("Listening (WRAP mode)")
+	case *aggregate:
 		fmt.Println("Listening (aggregate mode)")
-	} else {
+	default:
 		fmt.Println("Listening")
 	}
 
