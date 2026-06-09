@@ -67,6 +67,42 @@ jobs:
         # a no-op on subsequent deploys.
         run: sudo -n bash ./scripts/bootstrap.sh
 
+      - name: Inject WRAP_KEY into udp.env (if secret is set)
+        # The wrap shared key lives in repo secrets as WRAP_KEY so it
+        # never lands in the public repo / Actions logs. When it's set,
+        # we rewrite EXTRA_ARGS in /etc/vk-turn-proxy/udp.env to include
+        # `-wrap -wrap-key <KEY>` so vk-turn-proxy@udp comes up in WRAP
+        # mode after the unit restart. Idempotent: regex-replaces the
+        # whole EXTRA_ARGS line so re-runs converge on the latest key.
+        # If the secret is unset / empty, this step is a no-op and the
+        # server stays in legacy mode.
+        env:
+          WRAP_KEY: ${{ secrets.WRAP_KEY }}
+        run: |
+          set -e
+          if [ -z "${WRAP_KEY}" ]; then
+            echo "WRAP_KEY secret not set — leaving udp.env EXTRA_ARGS as is"
+            exit 0
+          fi
+          if [ "${#WRAP_KEY}" -ne 64 ]; then
+            echo "::error::WRAP_KEY must be exactly 64 hex chars (got ${#WRAP_KEY})"
+            exit 1
+          fi
+          if ! [ -f /etc/vk-turn-proxy/udp.env ]; then
+            echo "::warning::/etc/vk-turn-proxy/udp.env doesn't exist yet — bootstrap should have created it; skipping"
+            exit 0
+          fi
+          # Mask the key so it never lands in the Actions log even on
+          # accidental echo / set -x.
+          echo "::add-mask::${WRAP_KEY}"
+          sudo sed -i "s|^EXTRA_ARGS=.*$|EXTRA_ARGS=-wrap -wrap-key ${WRAP_KEY}|" /etc/vk-turn-proxy/udp.env
+          # Confirm the line is there (without exposing the key).
+          sudo grep -c '^EXTRA_ARGS=-wrap' /etc/vk-turn-proxy/udp.env || {
+            echo "::error::EXTRA_ARGS=-wrap not present in udp.env after sed"
+            exit 1
+          }
+          echo "udp.env EXTRA_ARGS updated to enable WRAP mode."
+
       - name: Build server binary
         run: |
           mkdir -p dist

@@ -60,6 +60,20 @@ func main() {
 	solveSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
 	initPeers()
 
+	// Headless captcha fallback: opt-in via env. When on, vk_captcha.go
+	// escalates from the fast Go solver to chromedp-driven Chromium if
+	// the Go path can't recover from VK's BOT verdict. Requires
+	// chrome-headless-shell (or any chromium binary) on PATH or via
+	// CHROMIUM_PATH override. See deploy/install-chrome-headless-shell.sh.
+	if v := os.Getenv("HEADLESS_CAPTCHA"); v == "1" || v == "true" {
+		headlessCaptchaEnabled = true
+		log.Printf("captcha: headless escalation ENABLED (HEADLESS_CAPTCHA=%q)", v)
+	}
+	if p := os.Getenv("CHROMIUM_PATH"); p != "" {
+		chromiumPathOverride = p
+		log.Printf("captcha: chromium override CHROMIUM_PATH=%q", p)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cred", handleCred)
 	mux.HandleFunc("/internal/cred", handleInternalCred)

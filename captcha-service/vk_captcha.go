@@ -158,12 +158,27 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 	log.Printf("[Captcha] PoW solved: hash=%s", hash)
 
 	successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel)
-	if err != nil {
-		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
+	if err == nil {
+		log.Printf("[Captcha] Success! Got success_token")
+		return successToken, nil
 	}
 
-	log.Printf("[Captcha] Success! Got success_token")
-	return successToken, nil
+	// Fast Go solver failed (almost always VK returned `checkbox status:
+	// BOT` then the slider couldn't recover either). If the operator has
+	// chrome-headless-shell installed and HEADLESS_CAPTCHA=1, escalate
+	// to the real-browser MITM solver — it runs VK's anti-bot JS for
+	// real and beats `BOT` verdicts that the plain-HTTP solver can't.
+	if headlessCaptchaEnabled {
+		log.Printf("[Captcha] go-solver failed (%v) — escalating to headless MITM solver", err)
+		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectUri, captchaProxyDialer())
+		if hErr == nil {
+			log.Printf("[Captcha] Success! Got success_token via headless")
+			return token, nil
+		}
+		return "", fmt.Errorf("captchaNotRobot API failed: %w; headless fallback: %w", err, hErr)
+	}
+
+	return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 }
 
 func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
