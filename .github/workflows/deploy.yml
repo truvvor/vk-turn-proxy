@@ -112,8 +112,11 @@ jobs:
         shell: bash
         run: |
           set -e
+          # /etc/wireguard/ is typically 0700 root:root so the runner
+          # user can't traverse it — every probe has to go through
+          # sudo. Same story for /etc/vk-turn-proxy/udp.env later.
           has_wg=false
-          if compgen -G "/etc/wireguard/*.conf" >/dev/null; then
+          if sudo -n bash -c 'compgen -G "/etc/wireguard/*.conf" >/dev/null' 2>/dev/null; then
             has_wg=true
           elif command -v wg >/dev/null 2>&1 && [ -n "$(sudo -n wg show 2>/dev/null)" ]; then
             has_wg=true
@@ -187,7 +190,7 @@ jobs:
             echo "::error::WRAP_KEY must be exactly 64 hex chars (got ${#WRAP_KEY})"
             exit 1
           fi
-          if ! [ -f /etc/vk-turn-proxy/udp.env ]; then
+          if ! sudo -n test -f /etc/vk-turn-proxy/udp.env; then
             echo "::warning::/etc/vk-turn-proxy/udp.env doesn't exist yet — bootstrap should have created it; skipping"
             exit 0
           fi
