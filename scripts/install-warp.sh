@@ -69,10 +69,15 @@ if ! [ -x "$WGCF_BIN" ]; then
 fi
 
 # Register a Cloudflare WARP account if we don't already have one.
-# yes feeds the EULA prompt; --accept-tos belt-and-suspenders.
+# --accept-tos handles the EULA prompt itself; an earlier version of
+# this script piped `yes` in as belt-and-suspenders which races wgcf's
+# stdin close → SIGPIPE 141 → set -euo pipefail aborts the script even
+# though the register itself succeeded. The account toml gets written
+# before that failure, so the wgcf is idempotent enough that a re-run
+# skips this step anyway — but no point making the operator re-run.
 if ! [ -f "$WGCF_ACCOUNT" ]; then
     cd "$WGCF_DIR"
-    yes | "$WGCF_BIN" register --accept-tos
+    "$WGCF_BIN" register --accept-tos
 fi
 
 # Generate the WireGuard config from the registered account if it's
