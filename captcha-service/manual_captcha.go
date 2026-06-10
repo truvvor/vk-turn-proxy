@@ -33,6 +33,27 @@ const captchaListenPort = "8765"
 // up to 4 swipes × ~5 s round-trip (~20 s) + safety margin.
 const headlessSolveTimeout = 60 * time.Second
 
+// headlessSolveSlot serialises MITM/headless solves so only one
+// chromedp instance binds the captcha proxy port at a time.
+// solveCaptchaViaProxy listens on a fixed localhost:8765 (driven by
+// the URL rewriter for VK→local origin substitution) and the iOS-
+// tree client's design assumed one solve per process. On the cluster
+// /cred requests arrive concurrently; without this, two concurrent
+// escalations race the bind and the second one dies with
+//
+//	bind: address already in use
+//
+// while the first sees an unrelated VK status.
+//
+// Buffer-of-1 channel acts as a binary semaphore: a concurrent
+// solve waits in the select below until the current MITM finishes.
+// The headlessSolveQueueTimeout cap stops a backed-up cluster from
+// queueing forever — pulling out is the right move so the cluster
+// master can rotate to another peer.
+var headlessSolveSlot = make(chan struct{}, 1)
+
+const headlessSolveQueueTimeout = 90 * time.Second
+
 var customCaptchaHost string
 
 type browserCommand struct {
@@ -750,6 +771,15 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity ClientIdentity) (string, error) {
+	// Serialise against any concurrent MITM solve on this process;
+	// see headlessSolveSlot comment for the bind-conflict story.
+	select {
+	case headlessSolveSlot <- struct{}{}:
+	case <-time.After(headlessSolveQueueTimeout):
+		return "", fmt.Errorf("headless solver busy: waited %s for slot", headlessSolveQueueTimeout)
+	}
+	defer func() { <-headlessSolveSlot }()
+
 	keyCh := make(chan string, 1)
 	// failCh fires once for any terminal VK session status that
 	// guarantees no further attempt on this session can succeed —
