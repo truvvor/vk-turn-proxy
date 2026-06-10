@@ -41,8 +41,16 @@ RestrictNamespaces=user
 LockPersonality=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
-CapabilityBoundingSet=
-AmbientCapabilities=
+# CAP_NET_RAW is required for SO_BINDTODEVICE, which warp_dialer.go
+# uses to pin VK-bound sockets to the wgcf interface when
+# WARP_INTERFACE is set. With DynamicUser=yes the process runs as a
+# non-root ephemeral user, so without an explicit Ambient cap the
+# bind() returns EPERM. CapabilityBoundingSet=CAP_NET_RAW caps the
+# total privilege envelope to exactly that one capability; granting
+# it unconditionally (even when WARP is off) keeps the unit text
+# stable across nodes where the operator may turn WARP on later.
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 LimitNOFILE=65536
 
 [Install]

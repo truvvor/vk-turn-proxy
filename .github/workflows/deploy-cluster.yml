@@ -36,6 +36,10 @@ on:
         description: TCP port for captcha-service
         required: false
         default: '18080'
+      warp:
+        description: 'Provision Cloudflare WARP egress (registers a free WARP account via wgcf and brings up wg-quick@wgcf with Table=off; captcha-service then SO_BINDTODEVICEs every VK-bound socket to it)'
+        required: false
+        default: 'true'
 
 concurrency:
   # Serialise cluster rolls; never tear down a roll mid-flight.
@@ -140,6 +144,26 @@ jobs:
           echo "Installing chrome-headless-shell on ${{ matrix.runner }}..."
           sudo bash scripts/install-chrome-headless-shell.sh
 
+      - name: Provision Cloudflare WARP (idempotent)
+        # Stand up a wg-quick@wgcf tunnel pinned to Cloudflare's WARP
+        # edge so captcha-service can SO_BINDTODEVICE its VK-bound
+        # sockets to a Cloudflare egress IP. See scripts/install-warp.sh
+        # for the full story; it's idempotent and a no-op when wgcf is
+        # already up. The "Compose env file" step downstream only sets
+        # WARP_INTERFACE=wgcf when `wg show wgcf` actually works, so a
+        # failed provision falls back to vanilla egress cleanly without
+        # captcha-service crashing on a missing iface.
+        if: inputs.warp == 'true'
+        run: |
+          set -e
+          if sudo wg show wgcf >/dev/null 2>&1; then
+            echo "wgcf already up on ${{ matrix.runner }}, skipping provision"
+            sudo wg show wgcf | head -10
+            exit 0
+          fi
+          echo "Provisioning Cloudflare WARP on ${{ matrix.runner }}..."
+          sudo bash scripts/install-warp.sh
+
       - name: Compose env file and restart captcha-service
         env:
           API_KEY: ${{ secrets.CLUSTER_API_KEY }}
@@ -186,6 +210,21 @@ jobs:
             exit 1
           fi
 
+          # Only set WARP_INTERFACE if the previous "Provision
+          # Cloudflare WARP" step actually brought wgcf up. Setting
+          # it on a host with no wgcf iface would make every outbound
+          # socket fail at SO_BINDTODEVICE EAFNOSUPPORT/ENODEV — much
+          # worse than vanilla egress. `wg show wgcf` is the cheapest
+          # liveness probe; an active interface returns its peer info,
+          # a missing one returns rc=1.
+          WARP_LINE=""
+          if sudo wg show wgcf >/dev/null 2>&1; then
+            WARP_LINE="WARP_INTERFACE=wgcf"
+            echo "WARP detected — captcha-service will pin VK sockets to wgcf"
+          else
+            echo "WARP iface wgcf not present — captcha-service will use default egress"
+          fi
+
           # Write the env file via a temp + mv so an in-flight read on
           # the running unit doesn't see a half-written file.
           # HEADLESS_CAPTCHA=1 + CHROMIUM_PATH activate the chrome-
@@ -199,6 +238,7 @@ jobs:
           SELF_URL=${SELF_URL}
           HEADLESS_CAPTCHA=1
           CHROMIUM_PATH=/usr/local/bin/chrome-headless-shell
+          ${WARP_LINE}
           EOF
           sudo install -m 0640 -o root -g root "$tmp" /etc/vk-turn-proxy/captcha-service.env
           rm -f "$tmp"
