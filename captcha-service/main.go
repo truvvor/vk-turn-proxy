@@ -70,6 +70,11 @@ func main() {
 	}
 	solveSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
 	initPeers()
+	// Background healthcheck loop: pings every non-self peer's
+	// /healthz on a 15 s ticker and parks dead peers out of the
+	// /cred routing table so a hung remote doesn't get included
+	// in round-robin. Runs for the lifetime of the process.
+	go runHealthcheckLoop(context.Background())
 
 	// Headless captcha fallback: opt-in via env. When on, vk_captcha.go
 	// escalates from the fast Go solver to chromedp-driven Chromium if
@@ -311,6 +316,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		URL                string `json:"url"`
 		Self               bool   `json:"self"`
 		Available          bool   `json:"available"`
+		Healthy            bool   `json:"healthy"`
 		SaturatedRemaining int64  `json:"saturated_remaining_seconds"`
 	}
 	peerStats := make([]peerStat, 0, len(peers))
@@ -321,10 +327,14 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		if p.saturatedUntil.After(now) {
 			remaining = int64(p.saturatedUntil.Sub(now).Seconds())
 		}
+		// Self is always healthy from its own perspective; the
+		// healthcheck loop skips self peers entirely.
+		healthy := p.Self || p.healthy
 		peerStats = append(peerStats, peerStat{
 			URL:                p.statusLabel(),
 			Self:               p.Self,
-			Available:          p.saturatedUntil.Before(now),
+			Available:          healthy && p.saturatedUntil.Before(now),
+			Healthy:            healthy,
 			SaturatedRemaining: remaining,
 		})
 		p.mu.Unlock()

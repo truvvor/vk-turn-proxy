@@ -45,7 +45,27 @@ type peer struct {
 
 	mu             sync.Mutex
 	saturatedUntil time.Time
+	// healthy tracks whether the peer's /healthz is currently
+	// responsive. Defaults to true so we don't lock everyone out
+	// before the first healthcheck cycle runs; the background
+	// healthcheck loop (see runHealthcheckLoop) flips it to false
+	// the moment a probe fails and back to true on the next
+	// successful probe.
+	healthy           bool
+	lastHealthcheckAt time.Time
 }
+
+const (
+	// healthcheckInterval is how often the background loop pings
+	// each non-self peer's /healthz. 15 s gives a dead peer at most
+	// one stale /cred routing decision before it's pulled out of
+	// rotation, without overwhelming small clusters.
+	healthcheckInterval = 15 * time.Second
+	// healthcheckTimeout caps a single /healthz probe. Healthy
+	// peers respond in <10 ms; anything that takes longer than a
+	// second is effectively hung from the client's point of view.
+	healthcheckTimeout = 2 * time.Second
+)
 
 var (
 	peers    []*peer
@@ -77,7 +97,7 @@ func initPeers() {
 	selfURL := strings.TrimSpace(os.Getenv("SELF_URL"))
 
 	if peersEnv == "" {
-		peers = []*peer{{Self: true}}
+		peers = []*peer{{Self: true, healthy: true}}
 		log.Printf("cluster: single-node mode (no PEERS configured)")
 		return
 	}
@@ -98,7 +118,7 @@ func initPeers() {
 		if isSelf {
 			sawSelf = true
 		}
-		peers = append(peers, &peer{URL: url, Key: key, Self: isSelf})
+		peers = append(peers, &peer{URL: url, Key: key, Self: isSelf, healthy: true})
 	}
 
 	if !sawSelf {
@@ -118,7 +138,104 @@ func initPeers() {
 func (p *peer) isAvailable() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Self is always considered healthy — we're in the same process,
+	// the active healthcheck loop skips us. The healthy flag only
+	// gates remote peers, which the background loop tracks via
+	// /healthz probes.
+	if !p.Self && !p.healthy {
+		return false
+	}
 	return time.Now().After(p.saturatedUntil)
+}
+
+// markHealthy records a successful healthcheck and logs the
+// recovery transition. Idempotent — repeated calls only log on
+// the false→true transition.
+func (p *peer) markHealthy() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.healthy {
+		log.Printf("cluster: peer %s back online (healthcheck OK)", p.statusLabel())
+	}
+	p.healthy = true
+	p.lastHealthcheckAt = time.Now()
+}
+
+// markUnhealthy flags the peer as not eligible for /cred routing
+// until the next successful healthcheck. Logged on the true→false
+// transition so the operator can see the moment a peer dropped.
+func (p *peer) markUnhealthy(reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.healthy {
+		log.Printf("cluster: peer %s marked unhealthy (%s)", p.statusLabel(), reason)
+	}
+	p.healthy = false
+	p.lastHealthcheckAt = time.Now()
+}
+
+// healthcheckPeer issues a short-timeout GET /healthz against the
+// peer. Returns (true, nil) on a 2xx response, (false, err) otherwise.
+// Self peers always return true without dialing — we're in the same
+// process and /healthz wouldn't surface in-process hangs anyway.
+func healthcheckPeer(ctx context.Context, p *peer) (bool, error) {
+	if p.Self {
+		return true, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, healthcheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, "GET", p.URL+"/healthz", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := peerHTTPClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("healthz returned HTTP %d", resp.StatusCode)
+	}
+	return true, nil
+}
+
+// runHealthcheckLoop probes every non-self peer's /healthz on a
+// ticker and updates the peer.healthy flag. Started once from main
+// after initPeers; runs for the lifetime of the process.
+//
+// Why active probing: without it the cluster only learns a peer is
+// dead when a /cred request lands on it and waits out the per-call
+// HTTP timeout — that's seconds of latency per dead peer, paid by
+// every client request. With this loop a dead peer is dropped from
+// rotation within healthcheckInterval and only the healthcheck
+// goroutine pays the wait, not the request path.
+func runHealthcheckLoop(ctx context.Context) {
+	probe := func() {
+		for _, p := range peers {
+			if p.Self {
+				continue
+			}
+			ok, err := healthcheckPeer(ctx, p)
+			if ok {
+				p.markHealthy()
+			} else {
+				p.markUnhealthy(fmt.Sprintf("healthcheck: %v", err))
+			}
+		}
+	}
+	probe() // initial pass at startup so a dead peer is parked
+	// from the first /cred call onwards rather than waiting up to
+	// healthcheckInterval for the first tick.
+	tick := time.NewTicker(healthcheckInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			probe()
+		}
+	}
 }
 
 func (p *peer) markSaturated() {
@@ -176,6 +293,12 @@ func forwardToPeer(ctx context.Context, p *peer, link string, identity ClientIde
 
 	resp, err := peerHTTPClient.Do(req)
 	if err != nil {
+		// Any transport-level failure (connection refused, context
+		// canceled mid-request, EOF before headers) is signal that
+		// the peer is dead or hung. Mark it unhealthy so subsequent
+		// /cred calls skip it without paying the timeout again — the
+		// next healthcheck tick will flip it back on recovery.
+		p.markUnhealthy(fmt.Sprintf("transport: %v", err))
 		return nil, false, fmt.Errorf("call peer %s: %w", p.URL, err)
 	}
 	defer resp.Body.Close()
