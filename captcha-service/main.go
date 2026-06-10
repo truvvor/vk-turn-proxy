@@ -69,6 +69,12 @@ func main() {
 		log.Fatal("API_KEY env var is required")
 	}
 	solveSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
+	// Egress pool combines auto-discovered direct IPv4 addresses on
+	// this host's interfaces with the WARP_INTERFACE iface if set.
+	// Every VK-bound dialer (creds.go's sharedAuthClient,
+	// vk_captcha.go's newCaptchaClient, DoH lookups) picks one entry
+	// per call so VK sees a rotating source identity. See outbound.go.
+	initEgressPool()
 	initPeers()
 	// Background healthcheck loop: pings every non-self peer's
 	// /healthz on a 15 s ticker and parks dead peers out of the
@@ -351,6 +357,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		SaturatedNow  bool       `json:"saturated_now"`
 		UptimeSeconds int64      `json:"uptime_seconds"`
 		WARP          string     `json:"warp"`
+		Egress        []string   `json:"egress_pool"`
 		Peers         []peerStat `json:"peers"`
 	}{
 		Attempts:      stats.attempts,
@@ -362,6 +369,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		SaturatedNow:  directSaturated(),
 		UptimeSeconds: int64(time.Since(startedAt).Seconds()),
 		WARP:          warpStatus(),
+		Egress:        egressPoolSnapshot(),
 		Peers:         peerStats,
 	}
 	stats.mu.Unlock()

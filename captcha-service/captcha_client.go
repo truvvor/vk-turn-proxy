@@ -3,10 +3,12 @@
 // for VK API calls. See the iOS file for the full rationale of why
 // we use bogdanfinn/tls-client + fhttp instead of net/http.
 //
-// Server-side specific: the underlying net.Dialer carries the WARP
-// SO_BINDTODEVICE control hook so outbound captcha traffic egresses
-// via Cloudflare's WARP edge when WARP_INTERFACE is configured. See
-// warp_dialer.go.
+// Server-side specific: the underlying net.Dialer is constructed via
+// newEgressNetDialer(), which picks one entry from the egress pool
+// (direct IPs auto-discovered from interfaces + WARP iface when set)
+// and bakes its LocalAddr + Control into the dialer. vk_captcha.go
+// makes a fresh captcha client per /cred attempt, so successive
+// attempts land on different source IPs / WARP. See outbound.go.
 
 package main
 
@@ -56,9 +58,12 @@ func newTLSCaptchaClient() (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(tlsprofiles.Safari_IOS_18_0),
 		tlsclient.WithCookieJar(jar),
 		tlsclient.WithDisableHttp3(),
-		// WARP-pinned dialer if WARP_INTERFACE is set; otherwise a
-		// vanilla net.Dialer with a no-op control hook.
-		tlsclient.WithDialer(newWARPNetDialer()),
+		// Egress-pool dialer: picks one entry (direct IP via LocalAddr
+		// or WARP iface via SO_BINDTODEVICE) per call. tls-client
+		// keeps this dialer for the lifetime of the client, so the
+		// rotation happens at newCaptchaClient time — fresh choice
+		// every /cred attempt. See outbound.go.
+		tlsclient.WithDialer(newEgressNetDialer()),
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), opts...)
 }
