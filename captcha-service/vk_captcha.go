@@ -174,7 +174,20 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 	// chrome-headless-shell installed and HEADLESS_CAPTCHA=1, escalate
 	// to the real-browser MITM solver — it runs VK's anti-bot JS for
 	// real and beats `BOT` verdicts that the plain-HTTP solver can't.
+	//
+	// EXCEPT when the Go-side already reported a session-terminal VK
+	// status (ERROR_LIMIT / status: ERROR). On the SAME session token,
+	// VK won't accept a do-over from the headless browser either — it'll
+	// burn ~2 s on chromedp startup just to get the same status back.
+	// Skip straight to the cluster rotate path so a fresh peer (or a
+	// fresh session after captchaCooldown) handles the actual solve.
 	if headlessCaptchaEnabled {
+		errStr := err.Error()
+		if strings.Contains(errStr, "ERROR_LIMIT") || strings.Contains(errStr, "status: ERROR") {
+			log.Printf("[Captcha] go-solver hit terminal VK status (%v) — skipping headless (same session would also fail), marking saturated", err)
+			markCaptchaSaturated(isTunnel)
+			return "", fmt.Errorf("captchaNotRobot API failed (session terminal): %w", err)
+		}
 		log.Printf("[Captcha] go-solver failed (%v) — escalating to headless MITM solver", err)
 		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectUri, captchaProxyDialer(), identity)
 		if hErr == nil {
