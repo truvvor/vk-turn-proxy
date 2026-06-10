@@ -113,7 +113,7 @@ func customDial(ctx context.Context, network, address string) (net.Conn, error) 
 
 	// Fast path: literal IP needs no resolution.
 	if net.ParseIP(host) != nil {
-		return mkDialer(8 * time.Second).DialContext(ctx, network, address)
+		return mkDialer(8*time.Second).DialContext(ctx, network, address)
 	}
 
 	// Layer 1: system resolver.
