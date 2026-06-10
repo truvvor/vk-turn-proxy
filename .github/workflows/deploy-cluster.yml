@@ -1,16 +1,26 @@
 name: Deploy captcha cluster
 
 # Builds and rolls out captcha-service to every named runner in the
-# cluster (us, ubuntu, ukoverheat). Phase 1 installs the binary on each
-# host and reports its public IP back via an artifact. Phase 2 takes the
-# collected IPs, builds the PEERS env value, and writes the env file +
-# restarts the service on each host so every node knows every other
-# node.
+# cluster (us, ubuntu, ukoverheat). Each matrix cell is self-contained
+# — build, install, configure, restart, healthcheck — so a runner that
+# is offline / busy / has a stuck job doesn't block the rollout on the
+# others. The previous two-phase design (install matrix → configure
+# matrix that needs:install) made one offline runner park every other
+# node's restart forever, because the configure phase's `needs: install`
+# was waiting on the queued install job that nobody picked up.
 #
-# Auth: every node uses the SAME bearer token (repo secret CLUSTER_API_KEY).
-# Generate one with `openssl rand -hex 32` and add it under
-# Settings → Secrets and variables → Actions before running this workflow.
-# If the secret is empty the install phase fails fast with a clear message.
+# Auth: every node uses the SAME bearer token (repo secret
+# CLUSTER_API_KEY). Generate one with `openssl rand -hex 32` and add it
+# under Settings → Secrets and variables → Actions before running.
+#
+# Peer URLs: the cluster member IPs:port live in repo variable
+# vars.CLUSTER_PEERS as a comma-separated list, e.g.
+#   http://77.90.8.199:18080,http://67.217.246.160:18080,http://95.133.243.247:18080
+# Each cell composes the PEERS env value by appending |${API_KEY} to
+# every entry, and SELF_URL from its own detected public IP. If a
+# runner's detected public IP isn't found in CLUSTER_PEERS the cell
+# fails fast — that's a misconfig (probably a cloud-provider IP
+# reallocation) rather than silently running with the wrong identity.
 
 permissions:
   contents: read
@@ -39,10 +49,12 @@ jobs:
     # tooling here, and hosted minutes may be unavailable on this repo.
     runs-on: [self-hosted, linux, x64]
     steps:
-      - name: Verify CLUSTER_API_KEY is set
+      - name: Verify CLUSTER_API_KEY + CLUSTER_PEERS are set
         env:
           KEY: ${{ secrets.CLUSTER_API_KEY }}
+          PEERS_VAR: ${{ vars.CLUSTER_PEERS }}
         run: |
+          set -e
           if [ -z "${KEY}" ]; then
             echo "::error::Repo secret CLUSTER_API_KEY is empty. Generate one with"
             echo "::error::'openssl rand -hex 32' and add it under Settings → Secrets and variables → Actions."
@@ -50,9 +62,17 @@ jobs:
           fi
           # Don't print the key. Just confirm length looks plausible.
           echo "CLUSTER_API_KEY present, length=${#KEY}"
+          if [ -z "${PEERS_VAR}" ]; then
+            echo "::error::Repo variable CLUSTER_PEERS is empty. Set it under"
+            echo "::error::Settings → Secrets and variables → Actions → Variables to a"
+            echo "::error::comma-separated list of peer URLs, e.g."
+            echo "::error::  http://77.90.8.199:18080,http://67.217.246.160:18080,http://95.133.243.247:18080"
+            exit 1
+          fi
+          echo "CLUSTER_PEERS=${PEERS_VAR}"
 
-  install:
-    name: Install binary on ${{ matrix.runner }}
+  deploy:
+    name: Deploy on ${{ matrix.runner }}
     needs: preflight
     strategy:
       fail-fast: false
@@ -105,11 +125,11 @@ jobs:
 
       - name: Install chrome-headless-shell (idempotent)
         # Required by captcha-service's headless BOT-fallback path
-        # (HEADLESS_CAPTCHA=1, see configure job). The install script
+        # (HEADLESS_CAPTCHA=1, set in the env below). The install script
         # apt-installs Chromium's runtime libs and drops chrome-
-        # headless-shell at /usr/local/bin/chrome-headless-shell.
-        # Skips entirely if the binary is already present and runnable
-        # — re-runs on a healthy node are a 1-second no-op.
+        # headless-shell at /usr/local/bin/chrome-headless-shell. Skips
+        # entirely if the binary is already present and runnable — re-
+        # runs on a healthy node are a 1-second no-op.
         run: |
           set -e
           if [ -x /usr/local/bin/chrome-headless-shell ] \
@@ -120,88 +140,57 @@ jobs:
           echo "Installing chrome-headless-shell on ${{ matrix.runner }}..."
           sudo bash scripts/install-chrome-headless-shell.sh
 
-      - name: Detect public IP and export to artifact
-        id: ip
-        run: |
-          IP=$(curl -fsS --max-time 5 https://api.ipify.org \
-               || curl -fsS --max-time 5 https://ifconfig.me \
-               || echo "")
-          if [ -z "$IP" ]; then
-            echo "::error::Could not determine public IP via ipify or ifconfig.me"
-            exit 1
-          fi
-          echo "Detected public IP: $IP"
-          mkdir -p out
-          echo "$IP" > "out/${{ matrix.runner }}.txt"
-
-      - name: Upload IP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ip-${{ matrix.runner }}
-          path: out/
-          retention-days: 1
-          if-no-files-found: error
-
-  configure:
-    name: Configure ${{ matrix.runner }} (PEERS + restart)
-    needs: install
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ionos-us, ubuntu, ukoverheat]
-    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
-    steps:
-      - name: Download all IP artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ip-*
-          path: ips/
-          merge-multiple: true
-
       - name: Compose env file and restart captcha-service
         env:
           API_KEY: ${{ secrets.CLUSTER_API_KEY }}
+          PEERS_VAR: ${{ vars.CLUSTER_PEERS }}
           PORT: ${{ inputs.port }}
           MY_RUNNER: ${{ matrix.runner }}
         run: |
           set -e
 
-          # Load each peer IP from the artifact directory; fail loudly if
-          # any is missing (the cluster needs all members to know each
-          # other; partial PEERS would silently break round-robin).
-          read_ip() {
-            local label="$1"
-            if [ ! -f "ips/${label}.txt" ]; then
-              echo "::error::missing ips/${label}.txt — install job on ${label} did not upload"
-              exit 1
-            fi
-            tr -d '[:space:]' < "ips/${label}.txt"
-          }
+          # Detect own public IP so SELF_URL matches the cluster's
+          # external view (the entry the master uses to find us in its
+          # peer table). Tries two services for resilience.
+          MY_IP=$(curl -fsS --max-time 5 https://api.ipify.org \
+               || curl -fsS --max-time 5 https://ifconfig.me \
+               || echo "")
+          if [ -z "$MY_IP" ]; then
+            echo "::error::Could not determine public IP via ipify or ifconfig.me"
+            exit 1
+          fi
+          SELF_URL="http://${MY_IP}:${PORT}"
+          echo "MY_RUNNER=${MY_RUNNER}, MY_IP=${MY_IP}, SELF_URL=${SELF_URL}"
 
-          US_IP=$(read_ip ionos-us)
-          UBUNTU_IP=$(read_ip ubuntu)
-          UKOVERHEAT_IP=$(read_ip ukoverheat)
-
+          # Build PEERS by appending |${API_KEY} to each URL listed in
+          # vars.CLUSTER_PEERS. Validate SELF_URL is one of them — if
+          # not, the cloud provider likely rotated this runner's IP
+          # since CLUSTER_PEERS was last set, and we'd otherwise stand
+          # up an orphan node that's invisible to peer-routing.
           PEERS=""
-          for entry in "ionos-us:${US_IP}" "ubuntu:${UBUNTU_IP}" "ukoverheat:${UKOVERHEAT_IP}"; do
-            label="${entry%%:*}"
-            ip="${entry#*:}"
-            url="http://${ip}:${PORT}"
+          self_in_peers=0
+          IFS=',' read -ra PEER_URLS <<< "${PEERS_VAR}"
+          for url in "${PEER_URLS[@]}"; do
+            url=$(echo "$url" | tr -d '[:space:]')
+            if [ -z "$url" ]; then continue; fi
             PEERS="${PEERS:+${PEERS},}${url}|${API_KEY}"
+            if [ "$url" = "$SELF_URL" ]; then
+              self_in_peers=1
+            fi
           done
 
-          case "$MY_RUNNER" in
-            ionos-us)   MY_IP="$US_IP" ;;
-            ubuntu)     MY_IP="$UBUNTU_IP" ;;
-            ukoverheat) MY_IP="$UKOVERHEAT_IP" ;;
-          esac
-          SELF_URL="http://${MY_IP}:${PORT}"
+          if [ "$self_in_peers" -eq 0 ]; then
+            echo "::error::SELF_URL=${SELF_URL} is not in vars.CLUSTER_PEERS=${PEERS_VAR}."
+            echo "::error::Either this runner's public IP has changed (update CLUSTER_PEERS)"
+            echo "::error::or PORT (${PORT}) doesn't match what's in CLUSTER_PEERS."
+            exit 1
+          fi
 
           # Write the env file via a temp + mv so an in-flight read on
           # the running unit doesn't see a half-written file.
           # HEADLESS_CAPTCHA=1 + CHROMIUM_PATH activate the chrome-
-          # headless-shell BOT-fallback path that the install job above
-          # provisioned. captcha-service.go reads both at startup.
+          # headless-shell BOT-fallback path that the previous step
+          # provisioned. captcha-service main.go reads both at startup.
           tmp=$(mktemp)
           cat > "$tmp" <<EOF
           LISTEN_ADDR=:${PORT}
@@ -258,37 +247,29 @@ jobs:
 
   post:
     name: Cluster summary
-    needs: configure
+    needs: deploy
     runs-on: [self-hosted, linux, x64]
     if: always()
     steps:
-      - name: Download IP artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ip-*
-          path: ips/
-          merge-multiple: true
-
       - name: Print cluster overview
         env:
           PORT: ${{ inputs.port }}
+          PEERS_VAR: ${{ vars.CLUSTER_PEERS }}
         run: |
           {
             echo "## Cluster"
             echo ""
-            echo "| Node | URL |"
-            echo "|---|---|"
-            for label in ionos-us ubuntu ukoverheat; do
-              if [ -f "ips/${label}.txt" ]; then
-                ip=$(tr -d '[:space:]' < "ips/${label}.txt")
-                echo "| ${label} | \`http://${ip}:${PORT}\` |"
-              fi
+            echo "Configured peers (from \`vars.CLUSTER_PEERS\`):"
+            echo ""
+            IFS=',' read -ra PEER_URLS <<< "${PEERS_VAR}"
+            for url in "${PEER_URLS[@]}"; do
+              url=$(echo "$url" | tr -d '[:space:]')
+              [ -n "$url" ] && echo "- \`${url}\`"
             done
             echo ""
             echo "iOS client points to **any one** of these URLs (the entry-point"
             echo "node acts as master for that request and round-robins among all"
-            echo "peers transparently). For convenience keep the existing iOS"
-            echo "config (us) — it'll fan out automatically."
+            echo "peers transparently)."
             echo ""
             echo "API key: still the value of the \`CLUSTER_API_KEY\` repo secret."
             echo "Don't forget to open TCP/${PORT} in the cloud firewall on every node."
