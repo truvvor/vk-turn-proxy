@@ -40,7 +40,9 @@ const headlessSolveTimeout = 60 * time.Second
 // tree client's design assumed one solve per process. On the cluster
 // /cred requests arrive concurrently; without this, two concurrent
 // escalations race the bind and the second one dies with
-//   bind: address already in use
+//
+//	bind: address already in use
+//
 // while the first sees an unrelated VK status.
 //
 // Buffer-of-1 channel acts as a binary semaphore: a concurrent
