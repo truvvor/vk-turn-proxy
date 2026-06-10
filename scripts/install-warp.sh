@@ -85,7 +85,10 @@ fi
 # (here: root); chmod 0600 keeps the private key off other accounts.
 if ! [ -f "$WG_CONF" ]; then
     cd "$WGCF_DIR"
-    "$WGCF_BIN" generate -o "$WG_CONF"
+    # wgcf generate's profile flag is -p / --profile (the script used
+    # to use -o, which doesn't exist — fails on wgcf 2.2.27 with
+    # "unknown shorthand flag: 'o' in -o").
+    "$WGCF_BIN" generate -p "$WG_CONF"
     # CRITICAL: prevent WARP from grabbing the default route.
     # Without `Table = off` wg-quick installs WARP as the default
     # exit for the WHOLE host, which breaks the GitHub Actions
