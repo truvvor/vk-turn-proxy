@@ -50,14 +50,20 @@ const (
 )
 
 // dohClient is used ONLY for the DoH lookup itself. Plain net.Dialer
-// (no recursion into customDial), with the WARP control hook so DoH
-// queries to 1.1.1.1 also egress via the WARP interface when
-// WARP_INTERFACE is set. Cloudflare's 1.1.1.1 is reachable from inside
-// WARP just fine.
+// (no recursion into customDial). The egress pool's Control hook is
+// installed per Dial via dohDialContext so DoH queries to 1.1.1.1
+// rotate alongside VK traffic and pick up SO_BINDTODEVICE when WARP
+// is in the pool. Cloudflare's 1.1.1.1 is reachable from inside WARP
+// just fine.
+func dohDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	d := newEgressDialer(4 * time.Second)
+	return d.DialContext(ctx, network, address)
+}
+
 var dohClient = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
-		DialContext:     (&net.Dialer{Timeout: 4 * time.Second, Control: warpControl}).DialContext,
+		DialContext:     dohDialContext,
 		TLSClientConfig: &tls.Config{},
 	},
 }
@@ -94,15 +100,24 @@ func customDial(ctx context.Context, network, address string) (net.Conn, error) 
 		return nil, err
 	}
 
-	// Fast path: literal IP needs no resolution.
-	// Control hook pins the socket to WARP_INTERFACE when set; no-op
-	// otherwise. See warp_dialer.go.
-	if net.ParseIP(host) != nil {
-		return (&net.Dialer{Timeout: 8 * time.Second, Control: warpControl}).DialContext(ctx, network, address)
+	// Pick one egress entry up-front and stick with it across all
+	// resolution layers — system, DoH, hardcoded fallback — so VK
+	// sees a stable source IP per logical lookup attempt instead of
+	// the source flapping between layers' connect()s.
+	egress := pickEgress()
+	mkDialer := func(timeout time.Duration) *net.Dialer {
+		d := &net.Dialer{Timeout: timeout}
+		egress.applyEgress(d)
+		return d
 	}
 
-	// Layer 1: system resolver. WARP-pinned via Control hook.
-	d := &net.Dialer{Timeout: dohDialBudget, Control: warpControl}
+	// Fast path: literal IP needs no resolution.
+	if net.ParseIP(host) != nil {
+		return mkDialer(8*time.Second).DialContext(ctx, network, address)
+	}
+
+	// Layer 1: system resolver.
+	d := mkDialer(dohDialBudget)
 	sysCtx, cancel := context.WithTimeout(ctx, systemDialBudget)
 	conn, sysErr := d.DialContext(sysCtx, network, address)
 	cancel()
