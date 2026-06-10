@@ -580,20 +580,31 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	return fmt.Errorf("captcha listeners failed: %s", strings.Join(listenErrs, "; "))
 }
 
-// runCaptchaServerAndWait triggers the browser, and waiting gracefully for the solution token.
-func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string, identity ClientIdentity) (string, error) {
+// runCaptchaServerAndWait triggers the browser and waits for the solution token.
+//
+// failCh, when non-nil, lets the MITM proxy signal a terminal VK
+// session error (e.g. ERROR_LIMIT on captchaNotRobot.check) so the
+// solver bails out of the wait immediately instead of burning the
+// full headlessSolveTimeout. The returned error carries the status
+// string so the caller can decide whether to mark the peer
+// saturated, etc.
+func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, failCh <-chan string, logPrefix string, identity ClientIdentity) (string, error) {
 	srv := &http.Server{Handler: handler}
 
 	if err := startCaptchaServer(srv, logPrefix); err != nil {
 		return "", err
 	}
 
-	fmt.Println("\n==============================================")
-	fmt.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
-	fmt.Println("If your browser didn't open automatically,")
-	fmt.Println("manually open this URL: " + localCaptchaOrigin())
-	fmt.Println("==============================================")
-	fmt.Println()
+	// The "ACTION REQUIRED" banner only makes sense for a real human
+	// driving a browser; in headless mode it just pollutes journalctl.
+	if !headlessCaptchaEnabled {
+		fmt.Println("\n==============================================")
+		fmt.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
+		fmt.Println("If your browser didn't open automatically,")
+		fmt.Println("manually open this URL: " + localCaptchaOrigin())
+		fmt.Println("==============================================")
+		fmt.Println()
+	}
 
 	var captchaCleanup func()
 	if headlessCaptchaEnabled {
@@ -614,6 +625,12 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	if headlessCaptchaEnabled {
 		select {
 		case key = <-keyCh:
+		case fail := <-failCh:
+			log.Printf("[%s] headless: VK returned terminal status=%s — bailing out fast", logPrefix, fail)
+			shutCtx, sc := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = srv.Shutdown(shutCtx)
+			sc()
+			return "", fmt.Errorf("headless captcha terminal: %s", fail)
 		case <-time.After(headlessSolveTimeout):
 			log.Printf("[%s] headless: no success_token within %s — retrying fresh session", logPrefix, headlessSolveTimeout)
 			shutCtx, sc := context.WithTimeout(context.Background(), 2*time.Second)
@@ -676,7 +693,7 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Done!</h2></body></html>`)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error", ClientIdentity{})
+	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, nil, "captcha HTTP server error", ClientIdentity{})
 }
 
 type loggingTransport struct {
@@ -734,6 +751,16 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity ClientIdentity) (string, error) {
 	keyCh := make(chan string, 1)
+	// failCh fires once for any terminal VK session status that
+	// guarantees no further attempt on this session can succeed —
+	// ERROR_LIMIT is the canonical one (VK has rate-limited the
+	// source IP). When the MITM proxy spots one of those statuses
+	// in captchaNotRobot.check, it pushes the status onto failCh so
+	// runCaptchaServerAndWait bails out of its 60 s timeout in
+	// milliseconds, letting the cluster master rotate to the next
+	// peer instead of burning the full headless budget on a dead
+	// session.
+	failCh := make(chan string, 1)
 	// Slider ranker state. The Go-side fast solver tries up to
 	// content.Attempts candidates in a row when VK returns BOT; the
 	// headless path used to inject only candidates[0] which meant a
@@ -974,7 +1001,27 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 						if json.Unmarshal(bodyBytes, &parsed) == nil {
 							respObj, _ := parsed["response"].(map[string]interface{})
 							status, _ := respObj["status"].(string)
-							if status != "OK" {
+							switch status {
+							case "OK":
+								// Token path already handled above via
+								// notifyKey(extractSuccessToken).
+							case "ERROR_LIMIT", "ERROR":
+								// Terminal for this session — VK
+								// rate-limited the source IP or the
+								// session token is dead. No swipe
+								// retry will recover. Bail out fast so
+								// the cluster master can rotate to a
+								// non-saturated peer.
+								select {
+								case failCh <- status:
+								default:
+								}
+							default:
+								// Most likely BOT — the swipe answer
+								// was wrong but the session is still
+								// alive. Advance the candidate index so
+								// the next swipe picks up the next
+								// ranker guess.
 								sliderMu.Lock()
 								if len(sliderCandidates) > 0 {
 									sliderAttemptIdx++
@@ -1045,7 +1092,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer, identity
 		proxy.ServeHTTP(w, r)
 	})
 
-	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, "proxy HTTP server error", identity)
+	return runCaptchaServerAndWait(mux, localCaptchaURLForTarget(targetURL), keyCh, failCh, "proxy HTTP server error", identity)
 }
 
 func openBrowser(url string) {
