@@ -82,7 +82,22 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 
 		err = json.Unmarshal(body, &resp)
 		if err != nil {
-			return nil, err
+			// When VK / a WAF in front of it serves an HTML block
+			// page (typical first symptom of source-IP rate-limit
+			// or anti-bot tripping) the body starts with '<' and
+			// json.Unmarshal returns the unhelpful "invalid
+			// character '<' looking for beginning of value". Log
+			// the first ~400 bytes so the operator can tell at a
+			// glance whether it was a block page, a 5xx HTML, etc.
+			// rather than just "body wasn't JSON".
+			snip := string(body)
+			if len(snip) > 400 {
+				snip = snip[:400] + "...(truncated)"
+			}
+			log.Printf("[Auth] %s returned non-JSON body (HTTP %d, %d bytes): %s",
+				url, httpResp.StatusCode, len(body), snip)
+			return nil, fmt.Errorf("non-JSON response from %s (HTTP %d): %w",
+				url, httpResp.StatusCode, err)
 		}
 
 		return resp, nil
