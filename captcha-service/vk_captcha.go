@@ -181,6 +181,16 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 			log.Printf("[Captcha] Success! Got success_token via headless")
 			return token, nil
 		}
+		// When the headless MITM bailed out fast on a VK terminal
+		// status, mark this egress saturated so the cluster master
+		// rotates to the next peer immediately rather than burning
+		// the rest of the retry chain on the same dead IP. The
+		// solveCaptchaViaProxy err message carries the upstream
+		// status verbatim ("headless captcha terminal: ERROR_LIMIT"
+		// / "headless captcha terminal: ERROR").
+		if strings.Contains(hErr.Error(), "ERROR_LIMIT") || strings.Contains(hErr.Error(), "terminal:") {
+			markCaptchaSaturated(isTunnel)
+		}
 		return "", fmt.Errorf("captchaNotRobot API failed: %w; headless fallback: %w", err, hErr)
 	}
 
