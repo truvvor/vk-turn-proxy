@@ -73,9 +73,12 @@ const (
 // including an unexpected captcha gate — tells the caller to fall back to the
 // legacy captcha-solving flow.
 func getCredsViaVKCalls(ctx context.Context, link string, identity ClientIdentity) (string, string, []string, time.Duration, error) {
+	// Pick a profile from the family the client's UA claims so the uTLS
+	// ClientHello still matches the User-Agent we put on the wire; see
+	// identity.go::profileForClientUA.
 	profile := getRandomProfile()
 	if identity.UserAgent != "" {
-		profile.UserAgent = identity.UserAgent
+		profile = profileForClientUA(identity.UserAgent)
 	}
 	cookieHeader := identity.CookieHeader()
 
@@ -84,7 +87,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, identity ClientIdentit
 	linkURL := neturl.QueryEscape("https://vk.com/call/join/" + link)
 	nameEnc := neturl.QueryEscape(name)
 
-	client := newCaptchaClient(false)
+	client := newCaptchaClient(profile)
 
 	log.Printf("vkcalls: identity - name: %s, device_id: %s, client-identity=%v",
 		name, deviceID, !identity.Empty())

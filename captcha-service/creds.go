@@ -38,6 +38,30 @@ var (
 	credsViaLegacy atomic.Int64
 )
 
+// vkCred is one VK app identity for the legacy flow.
+//
+// This exists because of the lesson that cost us this whole debugging arc: VK
+// gates anonymous flows per (FQDN, method, client_id) TUPLE. We had exactly
+// one client_id on the legacy path, so when VK gated it there was nothing to
+// fall back to and every request walked into the same closed door. Rotating
+// over several app identities means a gate on one doesn't take the whole
+// legacy path down with it. Second pair from the WINGS-N fork.
+type vkCred struct {
+	clientID     string
+	clientSecret string
+}
+
+var vkCreds = []vkCred{
+	{clientID: "6287487", clientSecret: "QbYic1K3lEV5kTGiqlq2"},
+	{clientID: "8202606", clientSecret: "lMRsTiMCyPnp5vfoldmn"},
+}
+
+var vkCredRotation atomic.Uint64
+
+func nextVkCred() vkCred {
+	return vkCreds[int(vkCredRotation.Add(1)-1)%len(vkCreds)]
+}
+
 // getCreds obtains TURN credentials for a VK call link.
 //
 // Two paths, tried in order:
@@ -161,7 +185,12 @@ func getCredsLegacy(ctx context.Context, link string, identity ClientIdentity) (
 		}
 	}()
 
-	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
+	// Rotate the app identity: VK gates per client_id, so spreading the
+	// legacy path over several apps means one gated client_id doesn't close
+	// the whole fallback. See vkCreds.
+	cred := nextVkCred()
+	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s",
+		cred.clientID, cred.clientSecret, cred.clientID)
 	url := "https://login.vk.com/?act=get_anonym_token"
 
 	resp, err := doRequest(data, url)
@@ -172,7 +201,7 @@ func getCredsLegacy(ctx context.Context, link string, identity ClientIdentity) (
 	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-	reqURL := "https://api.vk.com/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
+	reqURL := "https://api.vk.com/method/calls.getAnonymousToken?v=5.274&client_id=" + cred.clientID
 
 	var token2 string
 	const maxCaptchaAttempts = 3

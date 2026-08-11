@@ -125,6 +125,7 @@ Error responses:
 | `API_KEY` | *(required)* | bearer token clients must send |
 | `CAPTCHA_TRAP_DIR` | `./trap` | where to write debug artefacts for failed solves (slider images, etc.) |
 | `VKCALLS_BYPASS` | `1` | `0`/`false` disables the captcha-free VK Calls path and forces the legacy captcha-solving flow |
+| `BROWSER_FP` | `auto` | pin the browser-fingerprint family: `chrome`, `edge`, `safari`, `firefox`, or `auto` (random across all). Each profile pairs a User-Agent with its matching uTLS ClientHello |
 | `WARP_INTERFACE` | *(unset)* | name of a pre-existing WireGuard interface (typically Cloudflare WARP) to pin VK-bound HTTP sockets to. See **WARP egress** below |
 
 ## WARP egress

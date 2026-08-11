@@ -116,6 +116,13 @@ func main() {
 		log.Printf("creds: VK Calls bypass ENABLED (api.vk.me + VK Connect, captcha-free); legacy flow is the fallback")
 	}
 
+	// Browser fingerprint family. Each profile pairs a User-Agent with the
+	// matching uTLS ClientHello, so the fleet no longer presents one TLS
+	// fingerprint on every request. BROWSER_FP pins a family; default auto.
+	initBrowserFamily()
+	log.Printf("identity: browser fingerprint family=%s (%d profiles available)",
+		browserFamily, len(profiles))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cred", handleCred)
 	mux.HandleFunc("/internal/cred", handleInternalCred)
@@ -385,6 +392,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		BypassEnabled bool       `json:"vkcalls_bypass_enabled"`
 		CredsBypass   int64      `json:"creds_via_bypass"`
 		CredsLegacy   int64      `json:"creds_via_legacy"`
+		BrowserFamily string     `json:"browser_fp_family"`
 		Peers         []peerStat `json:"peers"`
 	}{
 		Attempts:      stats.attempts,
@@ -400,6 +408,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		BypassEnabled: vkCallsBypassEnabled,
 		CredsBypass:   credsViaBypass.Load(),
 		CredsLegacy:   credsViaLegacy.Load(),
+		BrowserFamily: browserFamily,
 		Peers:         peerStats,
 	}
 	stats.mu.Unlock()
