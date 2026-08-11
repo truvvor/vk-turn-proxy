@@ -14,6 +14,11 @@ jobs:
     name: Build binaries
     runs-on: ubuntu-latest
     strategy:
+      # Don't cancel the other 15 targets when one fails. Without this a
+      # single broken platform takes the whole matrix down, `release`
+      # never runs (needs: build), and no release is cut at all — which
+      # is exactly how 0.19.1 stayed the latest tag through four merges.
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -44,12 +49,19 @@ jobs:
           - goos: linux
             goarch: riscv64
             cgo: 0
+          # Upstream does not build the SERVER for darwin: it pulls in
+          # linux-only netlink/wg-apply, and server/tui_terminal_unix.go
+          # uses unix.TCGETS/TCSETS, which are Linux ioctl constants
+          # (darwin spells them TIOCGETA/TIOCSETA). ci.yml already carries
+          # this flag; release.yml was missed. Client-only here.
           - goos: darwin
             goarch: amd64
             cgo: 0
+            skip_server: "true"
           - goos: darwin
             goarch: arm64
             cgo: 0
+            skip_server: "true"
           - goos: windows
             goarch: amd64
             cgo: 0
@@ -67,9 +79,13 @@ jobs:
             goarch: arm
             cgo: 1
             api: 21
+          # Same story on freebsd, one layer down: wgctrl's os_freebsd.go
+          # references wgfreebsd.New, which that module never provides, so
+          # ./server cannot link. Nothing we can fix on our side.
           - goos: freebsd
             goarch: amd64
             cgo: 0
+            skip_server: "true"
 
     steps:
       - name: Check out code
@@ -96,6 +112,7 @@ jobs:
           GOMIPS: ${{ matrix.gomips }}
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: ${{ matrix.cgo }}
+          SKIP_SERVER: ${{ matrix.skip_server }}
           ANDROID_API: ${{ matrix.api }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           VERSION: ${{ github.ref_name }}
@@ -136,10 +153,14 @@ jobs:
             -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
             ./client
 
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
-          go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
-            ./server
+          if [ "${SKIP_SERVER}" = "true" ]; then
+            echo "Skipping server build for ${GOOS}/${GOARCH} (unsupported upstream)"
+          else
+            GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
+            go build -ldflags "-s -w -checklinkname=0" -trimpath \
+              -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
+              ./server
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
