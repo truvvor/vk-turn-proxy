@@ -324,7 +324,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	captchaSid, _ := errData["captcha_sid"].(string)
 	if captchaSid == "" {
 		// VK sends the sid as a JSON number on some responses.
-		if sidNum, ok := errData["captcha_sid"].(float64); ok {
+		if sidNum, isNum := errData["captcha_sid"].(float64); isNum {
 			captchaSid = fmt.Sprintf("%.0f", sidNum)
 		}
 	}
