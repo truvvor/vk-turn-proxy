@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package vkturn.control.v1;
+
+option go_package = "github.com/cacggghp/vk-turn-proxy/controlpb;controlpb";
+
+// Relay is the management API the wingsv-panel calls over gRPC to drive a
+// vk-turn-proxy node: inspect status and manage the WireGuard/AmneziaWG peers
+// that back the tunnel. It is distinct from the DTLS relay data plane and from
+// the app self-enroll path (which reaches the panel over its own gRPC).
+service Relay {
+  rpc GetStatus(GetStatusRequest) returns (Status);
+  rpc ListPeers(ListPeersRequest) returns (Peers);
+  rpc CreatePeer(CreatePeerRequest) returns (Peer);
+  rpc DeletePeer(DeletePeerRequest) returns (DeletePeerResponse);
+  rpc ListFlows(ListFlowsRequest) returns (Flows);
+  rpc GetFlowStats(GetFlowStatsRequest) returns (FlowStats);
+  // StreamFlowStats pushes a FlowStats snapshot on a fast cadence so the panel
+  // shows live speed/traffic without polling each node. Same payload as
+  // GetFlowStats; the panel keeps the connection open and reads deltas.
+  rpc StreamFlowStats(GetFlowStatsRequest) returns (stream FlowStats);
+  // StreamFlows pushes the active-flow list on a fast cadence so the panel's flow
+  // graph updates live. Same payload as ListFlows.
+  rpc StreamFlows(ListFlowsRequest) returns (stream Flows);
+}
+
+message ListFlowsRequest {}
+
+// Flow is one active relay stream: the panel renders these as connection chains
+// (client IP:port -> session/stream -> relay).
+message Flow {
+  string session_id = 1;
+  uint32 stream_id = 2;
+  string client_ip = 3;
+  string remote = 4;
+  string protocol = 5;
+  uint32 version = 6;
+  uint64 rx_bytes = 7;
+  uint64 tx_bytes = 8;
+  uint64 rx_rate = 9;
+  uint64 tx_rate = 10;
+  int64 started_unix = 11;
+}
+
+message Flows {
+  repeated Flow flows = 1;
+}
+
+message GetFlowStatsRequest {}
+
+message FlowStats {
+  uint32 active_streams = 1;
+  uint32 active_sessions = 2;
+  uint64 total_sessions = 3;
+  double avg_session_lifetime_seconds = 4;
+  uint64 server_rx_bytes = 5;
+  uint64 server_tx_bytes = 6;
+  map<string, uint32> streams_by_protocol = 7;
+}
+
+message GetStatusRequest {}
+
+message Status {
+  string version = 1;
+  string wg_interface = 2;
+  uint32 peer_count = 3;
+  uint64 active_sessions = 4;
+  // The relay's DTLS data-plane listen address (the -listen flag), so the panel
+  // can derive the endpoint apps dial without a separate configuration.
+  string listen_endpoint = 5;
+}
+
+message ListPeersRequest {}
+
+message Peers {
+  repeated Peer peers = 1;
+}
+
+message CreatePeerRequest {
+  // Client WireGuard public key (base64). Empty asks the server to generate a
+  // keypair and return the private key in the Peer response.
+  string public_key = 1;
+  // Optional tunnel address (CIDR). Empty allocates the next free address from
+  // the node pool.
+  string allowed_ips = 2;
+}
+
+message Peer {
+  string public_key = 1;
+  // Set only when the server generated the keypair on this request.
+  string private_key = 2;
+  string allowed_ips = 3;
+  string server_public_key = 4;
+  uint64 rx_bytes = 5;
+  uint64 tx_bytes = 6;
+  int64 created_unix = 7;
+}
+
+message DeletePeerRequest {
+  string public_key = 1;
+}
+
+message DeletePeerResponse {}

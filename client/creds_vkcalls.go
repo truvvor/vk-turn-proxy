@@ -1,47 +1,24 @@
-// SPDX-License-Identifier: MIT
-//
-// creds_vkcalls.go — VK Calls captcha-free anon-join flow for the client.
-//
-// Ported from captcha-service/creds_vkcalls.go (which came from
-// WINGS-N/vk-turn-proxy, crediting anton48/vk-turn-proxy-ios commit 05583b6
-// for the original reverse-engineering of the VK Calls iOS app).
-//
-// WHY THE CLIENT NEEDS THIS TOO
-//
-// VK gates anonymous flows per (FQDN, method, client_id) tuple. The client's
-// legacy chain uses:
-//
-//	host:       login.vk.ru / api.vk.ru
-//	call ep:    /method/calls.getAnonymousToken
-//
-// and VK captcha-gated that tuple. Once gated, VK answers the automated
-// not_robot solve with status=BOT no matter how well we solve it — the
-// checkbox challenge is designed to be passed by a human, so the client falls
-// through to the manual browser flow and someone has to click it by hand.
-//
-// This path sidesteps the whole thing:
-//
-//	host:       api.vk.me                            (different FQDN)
-//	client_id:  8093730  (VK Connect public app_id)  (different app)
-//	auth ep:    /method/auth.getAnonymToken
-//	param:      anonymous_token=                     (not access_token=)
-//	api ver:    v=5.276
-//	call ep:    /method/messages.getAnonymCallToken   (not calls.getAnonymousToken)
-//
-// No captcha is issued at all, so there is nothing to solve — automatically
-// or by hand.
-//
-// It also lands on a different address cluster, which matters on restrictive
-// networks: login.vk.* / id.vk.* live on the auth/ID cluster
-// (93.186.237.1, 95.213.56.1) that some networks block, while api.vk.me
-// shares the API cluster with the permitted api.vk.com. See
-// captcha-service/dns_resolver.go for the full cluster map.
-//
-// getTokenChain tries this first and falls back to the legacy captcha chain
-// on any error, so the solvers stay as the safety net for when VK gates this
-// path too.
-
 package main
+
+// VK Calls captcha-free anon-join flow, ported from anton48/vk-turn-proxy-ios
+// commit 05583b6 (reverse-engineered 2026-05-17 from the VK Calls iOS app).
+//
+// VK Calls uses a different API surface than our legacy bootstrap:
+//
+//   host:       api.vk.me                        (not api.vk.com / api.vk.ru)
+//   client_id:  8093730  (VK Connect)            (not our vkCreds client_ids)
+//   auth ep:    /method/auth.getAnonymToken      (not login.vk.com get_anonym_token)
+//   param:      anonymous_token=                 (not access_token=)
+//   api ver:    v=5.276                          (legacy uses 5.282)
+//   call ep:    /method/messages.getAnonymCallToken  (not calls.getAnonymousToken)
+//
+// VK gates anon flows per (FQDN, method, client_id). On 2026-05-15 VK added a
+// captcha gate to calls.getAnonymousToken across our legacy client_ids; the
+// messages.getAnonymCallToken path with VK Connect's public client_id is
+// captcha-free as of 2026-05-17. This path is selected by -captcha-solver
+// bypass; on any failure getVkCredsWithFallback falls through to the legacy
+// captcha-solving flow, so the captcha solvers (v2/v1) remain the fallback for
+// when VK eventually gates this path too.
 
 import (
 	"context"
@@ -53,62 +30,46 @@ import (
 	"strings"
 	"time"
 
-	fhttp "github.com/bogdanfinn/fhttp"
-	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/google/uuid"
 )
 
 const (
-	// vkConnectClientID is VK Connect's public app_id (the vk8093730://
-	// scheme in VK Calls). No client_secret required; the anon token it
-	// mints carries an app_id:8093730 claim that passes
-	// messages.getAnonymCallToken without a captcha gate.
+	// vkConnectClientID is VK Connect's public app_id (vk8093730:// scheme in
+	// VK Calls). No client_secret required; the anon token it mints carries an
+	// app_id:8093730 claim that passes messages.getAnonymCallToken without a
+	// captcha gate.
 	vkConnectClientID = "8093730"
-	// vkCallsAPIHost is the FQDN VK Calls uses. Same backend as api.vk.com
-	// but VK gates per FQDN, so the captcha rules differ.
+	// vkCallsAPIHost is the FQDN VK Calls uses. Same backend as api.vk.com but
+	// VK gates per FQDN, so the captcha rules differ.
 	vkCallsAPIHost = "api.vk.me"
-	// vkCallsAPIVersion matches what the VK Calls iOS app sends.
+	// vkCallsAPIVersion matches what VK Calls iOS sends.
 	vkCallsAPIVersion = "5.276"
 )
 
-// vkCallsBypassEnabled gates this path. On by default; -no-vkcalls-bypass
-// turns it off to exercise the legacy captcha chain.
-var vkCallsBypassEnabled = true
-
-// getCredsViaVKCalls fetches TURN credentials over the captcha-free VK Calls
-// surface. Returns (user, pass, addresses, lifetime, error). Any error —
-// including an unexpected captcha gate — tells the caller to fall back to the
-// legacy captcha-solving chain.
-func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string, string, []string, time.Duration, error) {
-	// iPhone Safari, NOT a random desktop profile. api.vk.me is the private
-	// API of VK's iOS Calls app; a desktop Chrome identity there is exactly
-	// the mismatch VK's anti-bot pipeline challenges. See
-	// client/profiles.go::iosSafariProfiles.
-	profile := getIOSSafariProfile()
+// getVkCredsViaVKCalls fetches TURN credentials via the VK Calls captcha-free
+// path. Returns the same tuple as getVkCredsWithFallback. A returned error
+// (including an unexpected captcha gate) tells the caller to fall back to the
+// legacy flow.
+func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, string, []string, time.Duration, error) {
+	profile := getRandomProfile()
 	name := generateName()
 	deviceID := uuid.New().String()
 	linkURL := neturl.QueryEscape("https://vk.com/call/join/" + link)
 	nameEnc := neturl.QueryEscape(name)
 
-	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
-		tlsclient.WithTimeoutSeconds(20),
-		tlsclient.WithClientProfile(profile.TLS),
-		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
-		tlsclient.WithDialer(getCustomNetDialer()),
-	)
+	client, err := resolver.newTLSHTTPClient(profile, 20*time.Second)
 	if err != nil {
 		return "", "", nil, 0, fmt.Errorf("vkcalls tls client: %w", err)
 	}
 	defer client.CloseIdleConnections()
 
-	log.Printf("[STREAM %d] [VK Calls] identity - name: %s, device_id: %s", streamID, name, deviceID)
+	log.Printf("vkcalls: identity - name: %s, device_id: %s", name, deviceID)
 
-	// doRequest issues a POST with no body; VK/OK read every parameter from
-	// the URL. Headers are the minimal set the NATIVE VK Calls app sends —
-	// notably no Origin/Referer, which would imitate a WebView. VK Calls is
-	// a native client and the mismatch is a fingerprint tell.
+	// doRequest issues a POST with no body; VK/OK read all params from the URL.
+	// Headers are the minimal set the native VK Calls app sends - notably no
+	// Origin/Referer (those imitate a WebView; VK Calls is a native client).
 	doRequest := func(url string) (map[string]interface{}, error) {
-		req, reqErr := fhttp.NewRequestWithContext(ctx, "POST", url, nil)
+		req, reqErr := newFHTTPRequest(context.Background(), "POST", url, nil)
 		if reqErr != nil {
 			return nil, reqErr
 		}
@@ -122,7 +83,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 		}
 		defer func() {
 			if closeErr := httpResp.Body.Close(); closeErr != nil {
-				log.Printf("[STREAM %d] [VK Calls] close body: %s", streamID, closeErr)
+				log.Printf("vkcalls: close body: %s", closeErr)
 			}
 		}()
 		body, readErr := io.ReadAll(httpResp.Body)
@@ -131,8 +92,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 		}
 		var resp map[string]interface{}
 		if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
-			return nil, fmt.Errorf("unmarshal (HTTP %d): %w, body: %s",
-				httpResp.StatusCode, jsonErr, vkcallsTruncate(string(body), 200))
+			return nil, fmt.Errorf("unmarshal: %w, body: %s", jsonErr, vkcallsTruncate(string(body), 200))
 		}
 		return resp, nil
 	}
@@ -151,7 +111,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 		return "", "", nil, 0, fmt.Errorf("vkcalls step1 parse: %w (resp: %s)", err, vkcallsTruncResp(resp1))
 	}
 	anonymTokenEnc := neturl.QueryEscape(anonymToken)
-	log.Printf("[STREAM %d] [VK Calls] step1 OK, anonymous_token (%d chars)", streamID, len(anonymToken))
+	log.Printf("vkcalls: step1 OK, anonymous_token (%d chars)", len(anonymToken))
 
 	// Step 2: messages.getCallPreview -> user_id + secret.
 	step2URL := fmt.Sprintf(
@@ -174,11 +134,10 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 	if err != nil {
 		return "", "", nil, 0, fmt.Errorf("vkcalls step2 parse secret: %w", err)
 	}
-	log.Printf("[STREAM %d] [VK Calls] step2 OK, user_id=%s, secret (%d chars)", streamID, userIDStr, len(secret))
+	log.Printf("vkcalls: step2 OK, user_id=%s, secret (%d chars)", userIDStr, len(secret))
 
-	// Step 3: messages.getAnonymCallToken -> OK anonymToken. This is the
-	// method VK captcha-gated on the legacy path; VK Connect passes it
-	// captcha-free.
+	// Step 3: messages.getAnonymCallToken -> OK anonymToken. This is the method
+	// VK captcha-gated on the legacy path; VK Connect passes it captcha-free.
 	step3URL := fmt.Sprintf(
 		"https://%s/method/messages.getAnonymCallToken?v=%s&anonymous_token=%s&device_id=%s&link=%s&name=%s&user_id=%s&secret=%s&lang=en",
 		vkCallsAPIHost, vkCallsAPIVersion, anonymTokenEnc, deviceID, linkURL,
@@ -195,9 +154,10 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 	if err != nil {
 		return "", "", nil, 0, fmt.Errorf("vkcalls step3 parse: %w (resp: %s)", err, vkcallsTruncResp(resp3))
 	}
-	log.Printf("[STREAM %d] [VK Calls] step3 OK, OK anonymToken (%d chars)", streamID, len(okAnonymToken))
+	log.Printf("vkcalls: step3 OK, OK anonymToken (%d chars)", len(okAnonymToken))
 
-	// Step 4: OK auth.anonymLogin -> session_key.
+	// Step 4: OK auth.anonymLogin -> session_key. Same OK endpoint and shape as
+	// the legacy flow.
 	okDeviceID := uuid.New().String()
 	step4URL := "https://calls.okcdn.ru/fb.do?session_data=" +
 		neturl.QueryEscape(fmt.Sprintf(
@@ -212,7 +172,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 	if err != nil {
 		return "", "", nil, 0, fmt.Errorf("vkcalls step4 parse: %w (resp: %s)", err, vkcallsTruncResp(resp4))
 	}
-	log.Printf("[STREAM %d] [VK Calls] step4 OK, OK session_key (%d chars)", streamID, len(sessionKey))
+	log.Printf("vkcalls: step4 OK, OK session_key (%d chars)", len(sessionKey))
 
 	// Step 5: vchat.joinConversationByLink -> TURN credentials.
 	step5URL := fmt.Sprintf(
@@ -243,8 +203,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 		lifetime = time.Duration(rawTTL) * time.Second
 	}
 
-	log.Printf("[STREAM %d] [VK Calls] SUCCESS - username=%s, addresses (%d) %v, lifetime=%v",
-		streamID, user, len(addresses), addresses, lifetime)
+	log.Printf("vkcalls: SUCCESS - username=%s, addresses (%d) %v", user, len(addresses), addresses)
 	return user, pass, addresses, lifetime, nil
 }
 
@@ -316,9 +275,7 @@ func vkcallsParseTURNAddresses(turnServer map[string]interface{}) []string {
 		}
 		clean := strings.Split(s, "?")[0]
 		addr := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-		if addr != "" {
-			addrs = append(addrs, addr)
-		}
+		addrs = append(addrs, addr)
 	}
 	return addrs
 }

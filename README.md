@@ -1,5 +1,56 @@
 # Good TURN
 
+> ## Транспорт вендорится из [WINGS-N/vk-turn-proxy](https://github.com/WINGS-N/vk-turn-proxy)
+>
+> `client/`, `server/`, `internal/`, `sessionproto/`, `*pb/`, `wbstream/`,
+> `tcputil/`, `proto/` и корневые `go.mod`/`go.sum` — **копия апстрима**, а не
+> наш код. Правки в них делать не следует: они будут перезаписаны следующим
+> синком и превратятся в вечный конфликт.
+>
+> Причина: раньше нужное из апстрима переносилось по кусочкам, и каждый
+> непортированный кусок всплывал отказом в поле — солвер v2, DoH, ротация
+> TURN-адресов, WRAP-переговоры, protect-bridge. Апстримный клиент завязан на
+> их protobuf и internal-пакеты и по частям не отделяется, поэтому берётся
+> целиком.
+>
+> **Наше в этом репозитории:**
+> - `captcha-service/` — отдельный Go-модуль: кластер, WARP, пул egress-IP,
+>   headless-солвер, captcha-free путь VK Calls. С ним говорит iOS-приложение.
+> - `deploy/`, `scripts/`, `.github/` — systemd-юниты, установка, CI/CD,
+>   раскатка кластера.
+>
+> ### Синк с апстримом
+>
+> ```bash
+> git clone --depth 1 https://github.com/WINGS-N/vk-turn-proxy /tmp/ref
+> rm -rf client server tcputil internal sessionproto appcontrolpb \
+>        controlpb provisioningpb wbstream proto
+> for d in client server tcputil internal sessionproto appcontrolpb \
+>          controlpb provisioningpb wbstream proto; do
+>   [ -d "/tmp/ref/$d" ] && cp -a "/tmp/ref/$d" .
+> done
+> cp -a /tmp/ref/go.mod /tmp/ref/go.sum .
+> go build ./... && go test ./... && golangci-lint run --timeout=5m ./...
+> ```
+>
+> После синка **обязательно** сверить флаги сервера с тем, что пишет
+> `.github/workflows/deploy.yml` в `EXTRA_ARGS`. Апстрим их меняет: у него нет
+> флага `-wrap` (только `-wrap-mode`/`-wrap-cipher`/`-wrap-key`/
+> `-wrap-accept-client-keys`), и передача несуществующего флага роняет сервер
+> на старте — то есть кладёт все ноды разом:
+>
+> ```bash
+> grep -oE '"[a-z][a-z-]*"' server/options.go | sort -u
+> ```
+>
+> ### Строгий линтер и вендоренный код
+>
+> `.golangci.yml` включает `revive` и `govet: enable-all` — это НАШИ
+> добавления, у апстрима конфига нет вообще. Для вендоренных каталогов они
+> отключены (см. `linters.exclusions.rules`), иначе пришлось бы править
+> каждый апстримный файл. Дефолтный набор линтеров там продолжает работать.
+
+
 Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или ~~Яндекс телемоста~~. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
 
 Только для учебных целей!

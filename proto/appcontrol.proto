@@ -1,0 +1,282 @@
+syntax = "proto3";
+
+// AppControl is the LOCAL IPC between the WINGS V host app and the embedded
+// vk-turn-proxy client (libclient.so), served over a unix domain socket. It
+// replaces the older stdin/stdout/cookie-file channels with a typed contract:
+// the app pushes VK webview cookies in, and pulls the provisioned WireGuard
+// config out.
+package vkturn.appcontrol.v1;
+
+option go_package = "github.com/cacggghp/vk-turn-proxy/appcontrolpb;appcontrolpb";
+
+// The WINGS V app symlinks this file into app/src/main/proto and generates its
+// Java lite + grpc-java stubs from it, so the two sides never drift as gRPC fields
+// are added. protoc-gen-go ignores the java_* / optimize_for options below.
+option java_package = "wings.v.proto.appcontrol";
+option java_outer_classname = "AppControlProto";
+option optimize_for = LITE_RUNTIME;
+
+service AppControl {
+  rpc SetVKCookies(SetVKCookiesRequest) returns (SetVKCookiesResponse);
+  // GetVKCookies lets the app pull the current (possibly relay-rotated) session
+  // over gRPC instead of reading a vk_cookies_update line off stdout, so cookies
+  // never touch stdout / logcat.
+  rpc GetVKCookies(GetVKCookiesRequest) returns (GetVKCookiesResponse);
+  rpc Provision(ProvisionRequest) returns (ProvisionResponse);
+  // GetTelemetry returns the relay's live counters (connected TURN streams) once.
+  rpc GetTelemetry(GetTelemetryRequest) returns (Telemetry);
+  // StreamTelemetry pushes the connected-stream count the moment it changes, so the
+  // app tracks connect progress event-driven (as fast as the old PROXY_EVENT stdout
+  // scrape) instead of polling. The relay still prints the telemetry line for logs.
+  rpc StreamTelemetry(StreamTelemetryRequest) returns (stream Telemetry);
+  // Configure delivers the relay runtime configuration the host app used to pass
+  // as CLI flags. The relay launches with only the AppControl socket flags and
+  // blocks until the app calls Configure, then boots its engine from these fields.
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+  // StreamEvents pushes the relay's control events - connection-progress status,
+  // capabilities, captcha prompts, VK account-auth drive - that formerly rode the
+  // stdout PROXY_EVENT / PROXY_CAPS / CAPTCHA_ JSONL lines. The relay still prints
+  // those lines, but now only for the log; control flows over this stream.
+  rpc StreamEvents(StreamEventsRequest) returns (stream ProxyEvent);
+  // SubmitVKAccountCreds delivers the VK TURN credentials the host app intercepted
+  // in its sign-in WebView (or a cancel) back to the relay, replacing the
+  // vk_account_creds stdin line. Unlike stdin it also works on the root/kernel-WG
+  // path, where the relay runs under su with no writable stdin.
+  rpc SubmitVKAccountCreds(VKAccountCredsRequest) returns (VKAccountCredsResponse);
+  // PatchConfig live-applies a delta of runtime-mutable settings without a relay
+  // restart. Only the present fields are patched. The relay migrates its TURN
+  // worker fleet onto the new config snapshot gracefully (streams drain and recycle
+  // one at a time, traffic is not interrupted) and reports per-field progress over
+  // StreamEvents as PatchStatusEvent messages keyed by the request_id.
+  rpc PatchConfig(PatchConfigRequest) returns (PatchConfigResponse);
+  // StreamUnderlayIPs pushes each remote IP the relay pins to the physical interface for
+  // its own underlay (the VK TURN and peer servers it dials). On Windows the host app
+  // installs a matching /32 bypass route via the physical gateway: per-socket interface
+  // pinning alone leaves the tunnel's source address on the packet, which the upstream
+  // router drops, so the underlay must be excluded from the full tunnel by route too. The
+  // relay also logs each IP.
+  rpc StreamUnderlayIPs(StreamUnderlayIPsRequest) returns (stream UnderlayIP);
+}
+
+// ConfigureRequest mirrors the former CLI flags (clientOptions). Empty/zero
+// fields fall back to the relay's own defaults, matching the old flag behaviour.
+message ConfigureRequest {
+  string dns_mode = 1;             // -dns
+  string user_dns = 2;             // -user-dns
+  string peer = 3;                 // -peer (VK TURN endpoint)
+  string vk_link = 4;              // -vk-link (comma-joined)
+  string vk_link_secondary = 5;    // -vk-link-secondary
+  string listen = 6;               // -listen (local relay endpoint)
+  int32 threads = 7;               // -n
+  int32 creds_group_size = 8;      // -creds-group-size
+  string transport = 9;            // -transport (e.g. tcp)
+  bool udp = 10;                   // -udp
+  bool no_dtls = 11;               // -no-dtls
+  bool manual_captcha = 12;        // -manual-captcha
+  string captcha_solver = 13;      // -captcha-solver
+  string vk_auth = 14;             // -vk-auth (e.g. account)
+  string vk_session_file = 15;     // -vk-session-file
+  bool vk_cookie_file_poll = 16;   // -vk-cookie-file-poll
+  string session_mode = 17;        // -session-mode
+  string browser_fp = 18;          // -browser-fp
+  string turn_host = 19;           // -turn
+  string turn_port = 20;           // -port
+  string protect_sock = 21;        // -protect-sock
+  string wrap_mode = 22;           // -wrap-mode
+  string wrap_cipher = 23;         // -wrap-cipher
+  string wrap_key_hex = 24;        // -wrap-key
+  bool wrap_send_key = 25;         // -wrap-send-key
+  string proto_fp = 26;            // -proto-fp
+  // client_id is the managed client's panel id. The relay never needs it for the
+  // data path, but a managed client announces it in its mu SESSION hello so the
+  // node can attribute the session and echo that client's traffic-limit usage
+  // back in the heartbeat. Empty for a non-managed (anonymous) client.
+  string client_id = 27;
+}
+
+message ConfigureResponse {
+  string error = 1;
+}
+
+message SetVKCookiesRequest {
+  string cookies = 1;
+  string user_agent = 2;
+}
+
+message SetVKCookiesResponse {}
+
+message GetVKCookiesRequest {}
+
+message GetVKCookiesResponse {
+  string cookies = 1;
+  string user_agent = 2;
+}
+
+message ProvisionRequest {
+  string client_id = 1;
+  bytes token = 2;
+  string hwid = 3;
+  uint32 local_port = 4;
+}
+
+message ProvisionResponse {
+  WireguardConfig wg = 1;
+  string error = 2;
+}
+
+message GetTelemetryRequest {}
+
+message StreamTelemetryRequest {}
+
+message Telemetry {
+  int64 connected_streams = 1;
+}
+
+message StreamEventsRequest {}
+
+message StreamUnderlayIPsRequest {}
+
+// UnderlayIP is one remote IP the relay pinned to the physical interface for its underlay.
+message UnderlayIP {
+  string ip = 1;
+}
+
+// ProxyEvent is one relay control event. It carries exactly one of the variants
+// below - the same information the relay prints as a PROXY_EVENT JSONL line.
+message ProxyEvent {
+  oneof event {
+    StatusEvent status = 1;
+    CapsEvent caps = 2;
+    CaptchaEvent captcha = 3;
+    LockoutEvent lockout = 4;
+    VKAccountAuthEvent vk_account_auth = 5;
+    VKCookiesRequiredEvent vk_cookies_required = 6;
+    PatchStatusEvent patch_status = 7;
+    TrafficUsageEvent traffic_usage = 8;
+  }
+}
+
+// TrafficUsageEvent reports the managed client's traffic-limit usage the relay
+// received from the panel over its DTLS heartbeat, so the app can show the user
+// how much of the cap is used / remaining. used + remaining + limit are bytes;
+// limit_bytes 0 means no cap; disabled marks a manual cutoff. Emitted whenever a
+// heartbeat carries fresh usage for this session's managed client.
+message TrafficUsageEvent {
+  uint64 limit_bytes = 1;
+  uint64 used_bytes = 2;
+  uint64 remaining_bytes = 3;
+  bool disabled = 4;
+}
+
+// PatchStatusEvent reports the progress of one field of a PatchConfig request.
+// request_id echoes PatchConfigRequest.request_id; field is a stable key
+// (vk_links | threads | vk_auth | peer | turn_host | turn_port | dns | wrap).
+// state:
+//   applying              - migration/flip started, field is being applied
+//   applied               - fully applied (fleet migrated / flip done)
+//   failed                - could not apply; left as it was
+//   reverted_needs_restart - a live attempt broke (e.g. WRAP in-band turned off
+//                            and the server had no preset key); the relay rolled
+//                            back to the previous value and the new one will only
+//                            take effect on the next relay restart
+message PatchStatusEvent {
+  string request_id = 1;
+  string field = 2;
+  string state = 3;
+  string message = 4;
+}
+
+// StatusEvent reports a connection-progress phase (auth_ready, turn_ready,
+// dtls_ready, dtls_alive, ...). stream_id attributes it to a TURN stream (0 for
+// process-wide phases); connected_streams is the live count carried by the
+// dtls_alive heartbeat (0 when not reported).
+message StatusEvent {
+  string phase = 1;
+  int32 stream_id = 2;
+  int32 connected_streams = 3;
+}
+
+// CapsEvent advertises the relay event-protocol version and capability tokens.
+message CapsEvent {
+  int32 version = 1;
+  repeated string capabilities = 2;
+}
+
+// CaptchaEvent mirrors the PROXY_EVENT captcha payload. state is one of
+// required|pending|solving|solved|cancelled|expired; source is primary|pool; url
+// and user_agent are set for required/pending prompts.
+message CaptchaEvent {
+  string state = 1;
+  string source = 2;
+  string url = 3;
+  string user_agent = 4;
+}
+
+// LockoutEvent reports how long VK has locked out captcha attempts.
+message LockoutEvent {
+  int32 seconds = 1;
+}
+
+// VKAccountAuthEvent drives the VK account sign-in WebView. phase is
+// required|complete|failed; link is the VK join URL (required); reason is the
+// failure detail (failed).
+message VKAccountAuthEvent {
+  string phase = 1;
+  string link = 2;
+  string reason = 3;
+}
+
+// VKCookiesRequiredEvent asks the app to (re)deliver the VK web session so the
+// relay can mint a privileged TURN token.
+message VKCookiesRequiredEvent {}
+
+// PatchConfigRequest carries a delta: only the present fields are applied. Scalar
+// fields use proto3 optional presence; vk_links uses a wrapper message so an
+// absent patch (do not touch links) is distinct from patching to an empty pool.
+// Field names mirror ConfigureRequest.
+message PatchConfigRequest {
+  string request_id = 1;
+  optional string dns_mode = 2;       // instant global flip
+  optional string user_dns = 3;
+  optional string peer = 4;           // VK TURN endpoint (per-worker migration)
+  optional int32 threads = 5;         // worker count ramp up / drain down
+  optional string vk_auth = 6;        // account | anonymous (bidirectional)
+  optional string turn_host = 7;
+  optional string turn_port = 8;
+  optional string wrap_mode = 9;
+  optional string wrap_cipher = 10;
+  optional string wrap_key_hex = 11;
+  optional bool wrap_send_key = 12;   // WRAP in-band key delivery
+  VKLinksPatch vk_links = 13;         // presence => set the pool to these links
+  optional int32 creds_group_size = 14;
+}
+
+message VKLinksPatch {
+  repeated string links = 1;
+}
+
+message PatchConfigResponse {
+  bool accepted = 1;
+  // Populated when the whole patch was rejected outright (malformed / nothing
+  // patchable). Per-field outcomes still arrive as PatchStatusEvent.
+  string error = 2;
+}
+
+message VKAccountCredsRequest {
+  string link = 1;
+  string username = 2;
+  string credential = 3;
+  repeated string turn_urls = 4;
+  bool cancel = 5;
+}
+
+message VKAccountCredsResponse {}
+
+message WireguardConfig {
+  string private_key = 1;
+  string public_key = 2;
+  string address = 3;
+  string server_public_key = 4;
+  string allowed_ips = 5;
+  uint32 mtu = 6;
+}
