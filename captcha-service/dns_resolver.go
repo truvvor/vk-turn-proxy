@@ -75,21 +75,62 @@ type dohEntry struct {
 
 var dohCache sync.Map // host -> dohEntry
 
-// Last-resort hardcoded A records. Used only if BOTH system resolver
-// and DoH fail. VK's API endpoints have lived on these IPs for a long
-// time; refresh manually if VK migrates infrastructure.
+// Last-resort hardcoded A records. Used only if BOTH the system resolver
+// and DoH fail — layer 3 of 3, so on a healthy VPS it should stay cold.
+//
+// Provenance: re-derived 2026-08-11 from two independent vantage points
+// (this repo's build sandbox and an operator machine) that returned
+// byte-identical answers, which is why these are trusted despite VK
+// running geo-DNS. Re-derive with `getent ahostsv4 <host>` if VK migrates.
+//
+// The previous table was stale in a way that mattered: login.vk.com and
+// api.vk.com were both mapped to 87.240.132.78 / 87.240.137.158, and
+// neither address appears in either host's live answer today. 87.240.132.78
+// is in fact a vk.com WEB address, so the auth and API lookups were
+// pointed at the wrong cluster entirely — this layer would have failed
+// every time it fired.
+//
+// VK serves these names from three distinct address clusters, and the
+// split is operationally significant, not trivia:
+//
+//	auth/ID  93.186.237.1, 95.213.56.1
+//	         login.vk.com, login.vk.ru, id.vk.com, id.vk.ru
+//	web      87.240.129.133, 87.240.132.67/.72/.78, 87.240.137.164, 93.186.225.194
+//	         vk.com, vk.ru, m.vk.com
+//	API      87.240.129.140, 87.240.137.130/.206/.207/.208,
+//	         87.240.139.193, 87.240.190.70/.75, 93.186.225.205
+//	         api.vk.com, api.vk.ru, api.vk.me
+//
+// Restrictive networks in the field have been observed passing the web and
+// API clusters while blocking the auth/ID cluster — which is what makes the
+// VK Calls path (creds_vkcalls.go) valuable beyond dodging the captcha
+// gate: it draws its anon token from auth.getAnonymToken on api.vk.me, in
+// the API cluster, instead of login.vk.com in the blocked auth cluster.
 var fallbackIPs = map[string][]string{
-	"login.vk.com": {"87.240.132.78", "87.240.137.158"},
-	"api.vk.com":   {"87.240.132.78", "87.240.137.158"},
-	"id.vk.com":    {"87.240.132.78", "87.240.137.158"},
-	"vk.com":       {"87.240.132.78", "87.240.137.158"},
-	"m.vk.com":     {"87.240.132.78"},
-	// keep .ru hosts too in case some upstream code path still
-	// hits them (and they're reachable on the user's network).
-	"login.vk.ru": {"87.240.137.158", "87.240.190.78"},
-	"api.vk.ru":   {"87.240.137.158", "87.240.190.78"},
-	"id.vk.ru":    {"87.240.137.158", "87.240.190.78"},
-	"vk.ru":       {"87.240.137.158"},
+	// auth / VK-ID cluster.
+	"login.vk.com": {"93.186.237.1", "95.213.56.1"},
+	"login.vk.ru":  {"93.186.237.1", "95.213.56.1"},
+	"id.vk.com":    {"93.186.237.1", "95.213.56.1"},
+	"id.vk.ru":     {"93.186.237.1", "95.213.56.1"},
+
+	// web cluster.
+	"vk.com":   {"87.240.132.67", "87.240.132.72", "87.240.132.78", "93.186.225.194"},
+	"vk.ru":    {"87.240.132.67", "87.240.132.72", "87.240.132.78", "93.186.225.194"},
+	"m.vk.com": {"87.240.132.67", "87.240.132.72", "87.240.137.164"},
+
+	// API cluster. api.vk.me shares this pool with api.vk.com — same
+	// backend, different FQDN, which is precisely how VK can captcha-gate
+	// one and not the other: the gate keys on the (FQDN, method,
+	// client_id) tuple, not on the machine answering.
+	"api.vk.com": {"87.240.129.140", "87.240.137.130", "87.240.190.70", "93.186.225.205"},
+	"api.vk.ru":  {"87.240.129.140", "87.240.137.130", "87.240.190.70", "93.186.225.205"},
+	"api.vk.me":  {"87.240.129.140", "87.240.137.130", "87.240.190.70", "93.186.225.205"},
+
+	// OK relay — steps 4-5 (auth.anonymLogin, vchat.joinConversationByLink).
+	// Used by BOTH the bypass and legacy paths and previously absent from
+	// this map entirely, so a DoH outage took out credential fetch on every
+	// path rather than just one.
+	"calls.okcdn.ru": {"155.212.204.12", "155.212.204.136", "155.212.204.195"},
 }
 
 // customDial is the net.Dialer.DialContext-shaped function plug into
