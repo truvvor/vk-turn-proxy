@@ -175,13 +175,49 @@ jobs:
 
           # Detect own public IP so SELF_URL matches the cluster's
           # external view (the entry the master uses to find us in its
-          # peer table). Tries two services for resilience.
-          MY_IP=$(curl -fsS --max-time 5 https://api.ipify.org \
-               || curl -fsS --max-time 5 https://ifconfig.me \
-               || echo "")
-          if [ -z "$MY_IP" ]; then
-            echo "::error::Could not determine public IP via ipify or ifconfig.me"
+          # peer table). Collect every public address this host could
+          # legitimately answer on, not just whatever the echo service
+          # happens to return.
+          #
+          # The `ubuntu` node is multi-homed (67.217.246.160 and
+          # 198.71.56.216 — the pair in captcha-service/outbound.go's example
+          # OUTBOUND_BIND_IPS). ipify answers with whichever egress the
+          # request took, so a run can report the address that is NOT the one
+          # in CLUSTER_PEERS and the SELF_URL check then fails on a node that
+          # is configured perfectly well. That is exactly what happened on
+          # 2026-08-11: ionos-us and ukoverheat deployed, ubuntu failed.
+          #
+          # So: gather ipify's answer AND every globally-routable IPv4 bound
+          # to a local interface, then pick the one CLUSTER_PEERS knows about.
+          CANDIDATE_IPS=""
+          echo_ip=$(curl -fsS --max-time 5 https://api.ipify.org \
+                 || curl -fsS --max-time 5 https://ifconfig.me \
+                 || echo "")
+          [ -n "$echo_ip" ] && CANDIDATE_IPS="$echo_ip"
+          local_ips=$(ip -4 -o addr show scope global 2>/dev/null \
+                      | awk '{print $4}' | cut -d/ -f1 \
+                      | grep -vE '^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+                      || true)
+          CANDIDATE_IPS="$CANDIDATE_IPS $local_ips"
+          CANDIDATE_IPS=$(echo "$CANDIDATE_IPS" | tr ' ' '\n' | grep -v '^$' | sort -u)
+          if [ -z "$CANDIDATE_IPS" ]; then
+            echo "::error::Could not determine any public IP (echo services and local interfaces both came up empty)"
             exit 1
+          fi
+          echo "MY_RUNNER=${MY_RUNNER}, candidate IPs: $(echo $CANDIDATE_IPS | tr '\n' ' ')"
+
+          MY_IP=""
+          for cand in $CANDIDATE_IPS; do
+            if echo "${PEERS_VAR}" | tr ',' '\n' | tr -d '[:space:]' \
+               | grep -qx "http://${cand}:${PORT}"; then
+              MY_IP="$cand"
+              break
+            fi
+          done
+          if [ -z "$MY_IP" ]; then
+            # Keep the original diagnostic: none of our addresses is listed,
+            # which is a real misconfiguration rather than a detection flake.
+            MY_IP="${echo_ip:-$(echo $CANDIDATE_IPS | awk '{print $1}')}"
           fi
           SELF_URL="http://${MY_IP}:${PORT}"
           echo "MY_RUNNER=${MY_RUNNER}, MY_IP=${MY_IP}, SELF_URL=${SELF_URL}"
