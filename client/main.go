@@ -30,7 +30,6 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
@@ -211,18 +210,26 @@ func (l directTCPListener) AcceptTCP() (transport.TCPConn, error) {
 // applyBrowserProfile applies consistent User-Agent and Client Hints to bypass WAFs
 func applyBrowserProfile(req *http.Request, profile Profile) {
 	req.Header.Set("User-Agent", profile.UserAgent)
-	req.Header.Set("sec-ch-ua", profile.SecChUa)
-	req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-	req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	// Client Hints are Chromium-only. Safari and Firefox never send
+	// sec-ch-ua*, so emitting them (empty, no less) under those UAs is a
+	// tell rather than camouflage.
+	if profile.SecChUa != "" {
+		req.Header.Set("sec-ch-ua", profile.SecChUa)
+		req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+		req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	}
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("DNT", "1")
 }
 
 func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
 	req.Header.Set("User-Agent", profile.UserAgent)
-	req.Header.Set("sec-ch-ua", profile.SecChUa)
-	req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-	req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	// See applyBrowserProfile: Client Hints are Chromium-only.
+	if profile.SecChUa != "" {
+		req.Header.Set("sec-ch-ua", profile.SecChUa)
+		req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+		req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+	}
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("DNT", "1")
 }
@@ -825,16 +832,16 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		log.Printf("[STREAM %d] [VK Calls] bypass failed, falling back to legacy captcha chain: %v", streamID, err)
 	}
 
-	profile := Profile{
-		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
-		SecChUaMobile:   "?0",
-		SecChUaPlatform: `"Windows"`,
-	}
+	// iPhone Safari, matching the reference implementation in
+	// truvvor/turnbridge. VK's anti-bot pipeline does not challenge requests
+	// shaped like a real user opening a call link in Safari on an iPhone; a
+	// desktop Chrome identity is what it does challenge. UA and ClientHello
+	// are paired per entry so the two can't contradict each other.
+	profile := getIOSSafariProfile()
 
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(20),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithClientProfile(profile.TLS),
 		tlsclient.WithCookieJar(jar),
 		tlsclient.WithDialer(getCustomNetDialer()),
 	)
