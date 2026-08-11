@@ -16,13 +16,83 @@ import (
 	"log"
 	"net/http"
 	neturl "net/url"
-	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-type getCredsFunc func(context.Context, string, ClientIdentity) (string, string, string, error)
+type getCredsFunc func(context.Context, string, ClientIdentity) (string, string, []string, time.Duration, error)
+
+// vkCallsBypassEnabled gates the captcha-free VK Calls path (see
+// creds_vkcalls.go). On by default — it's the only path that currently gets
+// past VK's captcha gate on calls.getAnonymousToken. Set VKCALLS_BYPASS=0 to
+// force the legacy captcha-solving flow, e.g. to test the solvers.
+var vkCallsBypassEnabled = true
+
+// Path counters for /stats, so the operator can see at a glance whether the
+// captcha-free path is still holding or VK has gated it and we're back to
+// burning solver budget.
+var (
+	credsViaBypass atomic.Int64
+	credsViaLegacy atomic.Int64
+)
+
+// vkCred is one VK app identity for the legacy flow.
+//
+// This exists because of the lesson that cost us this whole debugging arc: VK
+// gates anonymous flows per (FQDN, method, client_id) TUPLE. We had exactly
+// one client_id on the legacy path, so when VK gated it there was nothing to
+// fall back to and every request walked into the same closed door. Rotating
+// over several app identities means a gate on one doesn't take the whole
+// legacy path down with it. Second pair from the WINGS-N fork.
+type vkCred struct {
+	clientID     string
+	clientSecret string
+}
+
+var vkCreds = []vkCred{
+	{clientID: "6287487", clientSecret: "QbYic1K3lEV5kTGiqlq2"},
+	{clientID: "8202606", clientSecret: "lMRsTiMCyPnp5vfoldmn"},
+}
+
+var vkCredRotation atomic.Uint64
+
+func nextVkCred() vkCred {
+	return vkCreds[int(vkCredRotation.Add(1)-1)%len(vkCreds)]
+}
+
+// getCreds obtains TURN credentials for a VK call link.
+//
+// Two paths, tried in order:
+//
+//  1. VK Calls (api.vk.me + VK Connect client_id) — captcha-free. VK gates
+//     anon flows per (FQDN, method, client_id) and this tuple is currently
+//     ungated, so it succeeds without touching the captcha machinery at all.
+//     See creds_vkcalls.go for the full reverse-engineering notes.
+//  2. Legacy (login.vk.com + api.vk.com calls.getAnonymousToken) — the
+//     original flow, captcha-gated by VK since 2026-05-15. Kept as the
+//     fallback so the v2 solver + headless escalation still cover us when VK
+//     eventually gates path 1 too.
+//
+// Returns every TURN address VK handed back (the caller picks / rotates) plus
+// the credential lifetime VK reported, so the caller doesn't have to guess an
+// expiry.
+func getCreds(ctx context.Context, link string, identity ClientIdentity) (string, string, []string, time.Duration, error) {
+	if vkCallsBypassEnabled {
+		user, pass, addrs, lifetime, err := getCredsViaVKCalls(ctx, link, identity)
+		if err == nil {
+			credsViaBypass.Add(1)
+			return user, pass, addrs, lifetime, nil
+		}
+		log.Printf("[Creds] VK Calls bypass path failed, falling back to legacy captcha flow: %v", err)
+	}
+	user, pass, addrs, lifetime, err := getCredsLegacy(ctx, link, identity)
+	if err == nil {
+		credsViaLegacy.Add(1)
+	}
+	return user, pass, addrs, lifetime, err
+}
 
 // sharedAuthClient — package-level so the connection pool spans the
 // whole server lifetime. See F4 in the iOS-side commit history.
@@ -39,7 +109,11 @@ var sharedAuthClient = &http.Client{
 	},
 }
 
-func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUser string, resPass string, resTurn string, resErr error) {
+// getCredsLegacy is the original login.vk.com + calls.getAnonymousToken flow.
+// VK captcha-gated calls.getAnonymousToken, so this path routes through
+// solveVkCaptcha (fast Go solver → headless Chromium escalation). Retained as
+// the fallback behind the VK Calls bypass; see getCreds.
+func getCredsLegacy(ctx context.Context, link string, identity ClientIdentity) (resUser string, resPass string, resAddrs []string, resLifetime time.Duration, resErr error) {
 	profile := getRandomProfile()
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
@@ -111,32 +185,37 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 		}
 	}()
 
-	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
+	// Rotate the app identity: VK gates per client_id, so spreading the
+	// legacy path over several apps means one gated client_id doesn't close
+	// the whole fallback. See vkCreds.
+	cred := nextVkCred()
+	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s",
+		cred.clientID, cred.clientSecret, cred.clientID)
 	url := "https://login.vk.com/?act=get_anonym_token"
 
 	resp, err := doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", nil, 0, fmt.Errorf("request error:%s", err)
 	}
 
 	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-	reqURL := "https://api.vk.com/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
+	reqURL := "https://api.vk.com/method/calls.getAnonymousToken?v=5.274&client_id=" + cred.clientID
 
 	var token2 string
 	const maxCaptchaAttempts = 3
 	for attempt := 0; attempt <= maxCaptchaAttempts; attempt++ {
 		resp, err = doRequest(data, reqURL)
 		if err != nil {
-			return "", "", "", fmt.Errorf("request error:%s", err)
+			return "", "", nil, 0, fmt.Errorf("request error:%s", err)
 		}
 
 		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
 			errCode, _ := errObj["error_code"].(float64)
 			if errCode == 14 {
 				if attempt == maxCaptchaAttempts {
-					return "", "", "", fmt.Errorf("captcha failed after %d attempts", maxCaptchaAttempts)
+					return "", "", nil, 0, fmt.Errorf("captcha failed after %d attempts", maxCaptchaAttempts)
 				}
 
 				captchaErr := ParseVkCaptchaError(errObj)
@@ -145,7 +224,7 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 
 					successToken, solveErr := solveVkCaptcha(ctx, captchaErr, identity)
 					if solveErr != nil {
-						return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
+						return "", "", nil, 0, fmt.Errorf("captcha solve error: %v", solveErr)
 					}
 
 					if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
@@ -160,7 +239,7 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 					continue
 				}
 			}
-			return "", "", "", fmt.Errorf("VK API error: %v", errObj)
+			return "", "", nil, 0, fmt.Errorf("VK API error: %v", errObj)
 		}
 
 		token2 = resp["response"].(map[string]interface{})["token"].(string)
@@ -172,7 +251,7 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 
 	resp, err = doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", nil, 0, fmt.Errorf("request error:%s", err)
 	}
 
 	token3 := resp["session_key"].(string)
@@ -182,15 +261,28 @@ func getCreds(ctx context.Context, link string, identity ClientIdentity) (resUse
 
 	resp, err = doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", nil, 0, fmt.Errorf("request error:%s", err)
 	}
 
-	user := resp["turn_server"].(map[string]interface{})["username"].(string)
-	pass := resp["turn_server"].(map[string]interface{})["credential"].(string)
-	turn := resp["turn_server"].(map[string]interface{})["urls"].([]interface{})[0].(string)
+	turnServer := resp["turn_server"].(map[string]interface{})
+	user := turnServer["username"].(string)
+	pass := turnServer["credential"].(string)
 
-	clean := strings.Split(turn, "?")[0]
-	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
+	// Return every address VK offered, not just urls[0]. The client can then
+	// rotate to the next one when a dial fails instead of writing off the
+	// whole credential (this is the "TURN address rotation" idea from the
+	// WINGS-N fork). vkcallsParseTURNAddresses is shared with the bypass path.
+	addresses := vkcallsParseTURNAddresses(turnServer)
+	if len(addresses) == 0 {
+		return "", "", nil, 0, fmt.Errorf("legacy: no valid TURN addresses parsed")
+	}
 
-	return user, pass, address, nil
+	var lifetime time.Duration
+	if rawLifetime, ok := turnServer["lifetime"].(float64); ok && rawLifetime > 0 {
+		lifetime = time.Duration(rawLifetime) * time.Second
+	} else if rawTTL, ok := turnServer["ttl"].(float64); ok && rawTTL > 0 {
+		lifetime = time.Duration(rawTTL) * time.Second
+	}
+
+	return user, pass, addresses, lifetime, nil
 }

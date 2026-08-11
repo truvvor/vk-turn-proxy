@@ -43,14 +43,12 @@ func randomHex(n int) string {
 	return hex.EncodeToString(bytes)
 }
 
-// newCaptchaClient now returns a TLS-fingerprinted client (Safari iOS
-// 18) that also pins outbound sockets to the WARP WireGuard interface
-// when WARP_INTERFACE is set. See captcha_client.go and warp_dialer.go.
-// forceDirect kept in the signature for callsite compat but ignored:
-// the iOS-side meaning (bypass utun for tunnel-egress rate-limit) has
-// no analog on a Linux server.
-func newCaptchaClient(_ bool) tlsclient.HttpClient {
-	c, err := newTLSCaptchaClient()
+// newCaptchaClient returns a TLS-fingerprinted client whose uTLS ClientHello
+// is paired with the profile's User-Agent (see identity.go), dialing through
+// the egress pool so the socket lands on a rotating source IP / the WARP
+// interface. See captcha_client.go and outbound.go.
+func newCaptchaClient(profile Profile) tlsclient.HttpClient {
+	c, err := newTLSCaptchaClient(profile)
 	if err != nil {
 		panic(fmt.Sprintf("newTLSCaptchaClient: %v", err))
 	}
@@ -144,14 +142,15 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 		return "", fmt.Errorf("no session_token in redirect_uri")
 	}
 
+	// Honour the iOS client's UA across the Go-solver HTTP path so
+	// fetchPowInput / componentDone / check all advertise the same browser
+	// the success_token will later be redeemed on — but pick a profile from
+	// the family that UA claims, so the ClientHello still matches it.
 	profile := getRandomProfile()
 	if identity.UserAgent != "" {
-		// Honour the iOS client's UA across the Go-solver HTTP path so
-		// fetchPowInput / componentDone / check all advertise the same
-		// browser the success_token will later be redeemed on.
-		profile.UserAgent = identity.UserAgent
+		profile = profileForClientUA(identity.UserAgent)
 	}
-	client := newCaptchaClient(forceDirect)
+	client := newCaptchaClient(profile)
 
 	powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri, identity)
 	if err != nil {
@@ -219,17 +218,17 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
 
 	req.Header.Set("User-Agent", profile.UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	// Safari iOS doesn't implement Client Hints. With Safari_IOS_18_0
-	// fingerprint we mirror real Safari at every layer, so drop
-	// sec-ch-ua* unconditionally.
+	req.Header.Set("Accept-Language", acceptLanguageOf(profile))
+	// Client Hints are Chromium-only; applyClientHints is a no-op under
+	// Safari / Firefox profiles, which never send sec-ch-ua*.
+	applyClientHints(req, profile)
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	if h := identity.CookieHeader(); h != "" {
 		req.Header.Set("Cookie", h)
 	}
-	applySafariHeaderOrder(req)
+	applyHeaderOrder(req, profile)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -317,7 +316,8 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
 		req.Header.Set("User-Agent", profile.UserAgent)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Accept-Language", acceptLanguageOf(profile))
+		applyClientHints(req, profile)
 		req.Header.Set("Origin", "https://id.vk.com")
 		req.Header.Set("Referer", "https://id.vk.com/")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
@@ -327,7 +327,7 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
 		if cookieHeader != "" {
 			req.Header.Set("Cookie", cookieHeader)
 		}
-		applySafariHeaderOrder(req)
+		applyHeaderOrder(req, profile)
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -505,11 +505,4 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
 	_, _ = vkReq("captchaNotRobot.endSession", baseParams)
 	markCaptchaSuccess(isTunnel)
 	return sliderToken, nil
-}
-
-func buildCaptchaDeviceJSON(profile Profile) string {
-	return fmt.Sprintf(
-		`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
-		profile.UserAgent,
-	)
 }
