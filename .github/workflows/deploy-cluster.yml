@@ -206,10 +206,17 @@ jobs:
           fi
           echo "MY_RUNNER=${MY_RUNNER}, candidate IPs: $(echo $CANDIDATE_IPS | tr '\n' ' ')"
 
+          # Normalise CLUSTER_PEERS to one URL per line. Strip whitespace
+          # PER LINE with sed, not with `tr -d '[:space:]'` over the whole
+          # stream — tr would delete the newlines too and glue every URL
+          # into a single unmatchable string. (vars.CLUSTER_PEERS also
+          # carries a trailing CR, hence stripping at all.)
+          PEER_LINES=$(printf '%s' "${PEERS_VAR}" | tr ',' '\n' \
+                       | sed 's/[[:space:]]//g' | grep -v '^$' || true)
+
           MY_IP=""
           for cand in $CANDIDATE_IPS; do
-            if echo "${PEERS_VAR}" | tr ',' '\n' | tr -d '[:space:]' \
-               | grep -qx "http://${cand}:${PORT}"; then
+            if printf '%s\n' "${PEER_LINES}" | grep -qxF "http://${cand}:${PORT}"; then
               MY_IP="$cand"
               break
             fi
