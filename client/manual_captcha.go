@@ -383,13 +383,22 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 		return "", err
 	}
 
-	fmt.Println("\n==============================================")
-	fmt.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
-	fmt.Println("Open this URL in your browser: " + localCaptchaOrigin())
-	fmt.Println("==============================================")
-	fmt.Println()
-
-	openBrowser(captchaURL)
+	// Headless mode drives the page itself, so the operator banner would be
+	// noise. In manual mode it's the whole point.
+	var captchaCleanup func()
+	if headlessCaptchaEnabled {
+		log.Printf("[%s] Launching headless Chromium...", logPrefix)
+		captchaCleanup = launchHeadlessCaptcha(captchaURL, headlessUserAgent)
+	} else {
+		fmt.Println("\n==============================================")
+		fmt.Println("ACTION REQUIRED: MANUAL CAPTCHA SOLVING NEEDED")
+		fmt.Println("Open this URL in your browser: " + localCaptchaOrigin())
+		fmt.Println("==============================================")
+		fmt.Println()
+		openBrowser(captchaURL)
+		captchaCleanup = func() {}
+	}
+	defer captchaCleanup()
 
 	key := <-keyCh
 
