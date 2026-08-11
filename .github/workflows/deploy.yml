@@ -197,10 +197,17 @@ jobs:
           # Mask the key so it never lands in the Actions log even on
           # accidental echo / set -x.
           echo "::add-mask::${WRAP_KEY}"
-          sudo sed -i "s|^EXTRA_ARGS=.*$|EXTRA_ARGS=-wrap -wrap-key ${WRAP_KEY}|" /etc/vk-turn-proxy/udp.env
+          # NB: the WINGS-N server has NO bare `-wrap` flag — it exposes
+          # -wrap-mode (default "on"), -wrap-cipher, -wrap-key and
+          # -wrap-accept-client-keys. Passing `-wrap` makes the binary exit
+          # on an unknown flag, which would have taken every node down on the
+          # first deploy after the transport swap. Setting -wrap-key alone is
+          # enough: it pins the preset key and -wrap-mode already defaults to
+          # accepting WRAP.
+          sudo sed -i "s|^EXTRA_ARGS=.*$|EXTRA_ARGS=-wrap-key ${WRAP_KEY}|" /etc/vk-turn-proxy/udp.env
           # Confirm the line is there (without exposing the key).
-          sudo grep -c '^EXTRA_ARGS=-wrap' /etc/vk-turn-proxy/udp.env || {
-            echo "::error::EXTRA_ARGS=-wrap not present in udp.env after sed"
+          sudo grep -c '^EXTRA_ARGS=-wrap-key' /etc/vk-turn-proxy/udp.env || {
+            echo "::error::EXTRA_ARGS=-wrap-key not present in udp.env after sed"
             exit 1
           }
           echo "udp.env EXTRA_ARGS updated to enable WRAP mode."

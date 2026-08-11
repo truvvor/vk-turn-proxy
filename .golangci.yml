@@ -58,6 +58,23 @@ linters:
       - linters:
           - errcheck
         source: "doRequest|packetPool\\.Get"
+
+      # Vendored upstream: the entire root module is now the transport tree
+      # taken from WINGS-N/vk-turn-proxy. Upstream lints with golangci-lint's
+      # DEFAULTS and no config; revive and govet's enable-all extras are OUR
+      # additions. Applying them here would mean editing every upstream file,
+      # which permanently diverges the tree and re-conflicts on every merge
+      # from upstream — the exact treadmill adopting their transport was
+      # meant to end.
+      #
+      # The default linter set still runs on this code, so genuine defects
+      # are still caught; only our stricter style/analysis additions are
+      # scoped off. Our own code lives in captcha-service/, a separate Go
+      # module that this config does not reach anyway.
+      - linters:
+          - revive
+          - govet
+        path: '^(client|server|internal|sessionproto|appcontrolpb|controlpb|provisioningpb|wbstream|tcputil|proto)/'
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

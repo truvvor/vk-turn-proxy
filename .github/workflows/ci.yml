@@ -65,9 +65,15 @@ jobs:
           - goos: linux
             goarch: amd64
             cgo: 0
+          # Upstream does not build the SERVER for darwin: it pulls in
+          # linux-only netlink/wg-apply, and server/tui_terminal_unix.go uses
+          # unix.TCGETS/TCSETS, which are Linux ioctl constants (darwin
+          # spells them TIOCGETA/TIOCSETA). Their release matrix carries the
+          # same skip_server flag. Client-only here.
           - goos: darwin
             goarch: arm64
             cgo: 0
+            skip_server: "true"
           - goos: android
             goarch: arm64
             cgo: 1
@@ -103,6 +109,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: ${{ matrix.cgo }}
+          SKIP_SERVER: ${{ matrix.skip_server }}
           ANDROID_API: ${{ matrix.api }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -141,10 +148,14 @@ jobs:
             -o "dist/client-${GOOS}-${GOARCH}${ext}" \
             ./client
           
-          GOOS=$GOOS GOARCH=$GOARCH \
-          go build -ldflags "-s -w -checklinkname=0" -trimpath \
-            -o "dist/server-${GOOS}-${GOARCH}${ext}" \
-            ./server
+          if [ "${SKIP_SERVER}" = "true" ]; then
+            echo "Skipping server build for ${GOOS}/${GOARCH} (unsupported upstream)"
+          else
+            GOOS=$GOOS GOARCH=$GOARCH \
+            go build -ldflags "-s -w -checklinkname=0" -trimpath \
+              -o "dist/server-${GOOS}-${GOARCH}${ext}" \
+              ./server
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
