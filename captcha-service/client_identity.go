@@ -18,10 +18,7 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 	"strings"
-
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 type ClientIdentity struct {
@@ -54,27 +51,4 @@ func (id ClientIdentity) CookieHeader() string {
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 	return strings.Join(parts, "; ")
-}
-
-// applyToRequest sets User-Agent + Cookie on a stdlib http.Request.
-// No-op when the corresponding identity field is empty so callers can
-// blanket-apply without first checking.
-func (id ClientIdentity) applyToRequest(req *http.Request) {
-	if id.UserAgent != "" {
-		req.Header.Set("User-Agent", id.UserAgent)
-	}
-	if h := id.CookieHeader(); h != "" {
-		req.Header.Set("Cookie", h)
-	}
-}
-
-// applyToFHTTPRequest is the fhttp variant for the tls-fingerprinted
-// captcha client used in vk_captcha.go.
-func (id ClientIdentity) applyToFHTTPRequest(req *fhttp.Request) {
-	if id.UserAgent != "" {
-		req.Header.Set("User-Agent", id.UserAgent)
-	}
-	if h := id.CookieHeader(); h != "" {
-		req.Header.Set("Cookie", h)
-	}
 }

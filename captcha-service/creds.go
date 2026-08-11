@@ -22,8 +22,6 @@ import (
 	"github.com/google/uuid"
 )
 
-type getCredsFunc func(context.Context, string, ClientIdentity) (string, string, []string, time.Duration, error)
-
 // vkCallsBypassEnabled gates the captcha-free VK Calls path (see
 // creds_vkcalls.go). On by default — it's the only path that currently gets
 // past VK's captcha gate on calls.getAnonymousToken. Set VKCALLS_BYPASS=0 to
