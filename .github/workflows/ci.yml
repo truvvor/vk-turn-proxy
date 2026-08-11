@@ -55,6 +55,35 @@ jobs:
       - name: Run tests
         run: |
           go test ./... -v
+
+      # captcha-service is a SEPARATE Go module, so `./...` from the repo root
+      # never reached it — it had gone unlinted and untested by CI since it was
+      # created, and a backlog of findings accumulated unnoticed. It is also
+      # the one Go module in this repo that is OURS (the root module is
+      # vendored upstream), so it is exactly the code that most needs the
+      # strict config.
+      - name: captcha-service (fmt, lint, tests)
+        working-directory: captcha-service
+        run: |
+          echo "Checking formatting with gofmt..."
+          fmt_output=$(gofmt -l . || true)
+          if [ -n "$fmt_output" ]; then
+            echo "The following files need formatting:"
+            echo "$fmt_output"
+            exit 1
+          fi
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Run golangci-lint (captcha-service)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          working-directory: captcha-service
+          args: --timeout=5m ./...
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
   build:
     name: Build binaries

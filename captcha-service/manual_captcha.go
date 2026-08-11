@@ -61,6 +61,14 @@ type browserCommand struct {
 	args []string
 }
 
+// setLocalCaptchaHost is the server-side counterpart of the client's
+// -captcha-host flag. captcha-service exposes no such flag today, so nothing
+// calls it and customCaptchaHost stays empty — but the six reads of that
+// variable below are live code, and this file is kept in sync with the
+// iOS/client copy it was lifted from. Deleting the setter would diverge the
+// two for no gain and leave the reads permanently dead.
+//
+//nolint:unused // retained for parity with the client tree; see above.
 func setLocalCaptchaHost(host string) error {
 	host = strings.TrimSpace(host)
 	if host == "" {
@@ -686,6 +694,13 @@ func notifyKey(keyCh chan<- string, key string) {
 	}
 }
 
+// solveCaptchaViaHTTP serves VK's older IMAGE captcha (captcha_img) to a human
+// via the local page. VK has moved to the not_robot web-challenge, which
+// solveCaptchaViaProxy handles, so nothing reaches this path right now — but
+// VK has flipped captcha shapes before, and this is the only code that copes
+// with the image variant. Same sync argument as setLocalCaptchaHost.
+//
+//nolint:unused // dormant image-captcha path; see above.
 func solveCaptchaViaHTTP(captchaImg string) (string, error) {
 	keyCh := make(chan string, 1)
 	mux := http.NewServeMux()

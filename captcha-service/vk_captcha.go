@@ -26,7 +26,7 @@ type VkCaptchaError struct {
 	ErrorMsg                string
 	CaptchaSid              string
 	CaptchaImg              string
-	RedirectUri             string
+	RedirectURI             string
 	IsSoundCaptchaAvailable bool
 	SessionToken            string
 	CaptchaTs               string
@@ -59,14 +59,14 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	codeFloat, _ := errData["error_code"].(float64)
 	code := int(codeFloat)
 
-	redirectUri, _ := errData["redirect_uri"].(string)
+	redirectURI, _ := errData["redirect_uri"].(string)
 	captchaSid, _ := errData["captcha_sid"].(string)
 	captchaImg, _ := errData["captcha_img"].(string)
 	errorMsg, _ := errData["error_msg"].(string)
 
 	var sessionToken string
-	if redirectUri != "" {
-		if parsed, err := url.Parse(redirectUri); err == nil {
+	if redirectURI != "" {
+		if parsed, err := url.Parse(redirectURI); err == nil {
 			sessionToken = parsed.Query().Get("session_token")
 		}
 	}
@@ -92,7 +92,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		ErrorMsg:                errorMsg,
 		CaptchaSid:              captchaSid,
 		CaptchaImg:              captchaImg,
-		RedirectUri:             redirectUri,
+		RedirectURI:             redirectURI,
 		IsSoundCaptchaAvailable: isSound,
 		SessionToken:            sessionToken,
 		CaptchaTs:               captchaTs,
@@ -101,13 +101,13 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 }
 
 func (e *VkCaptchaError) IsCaptchaError() bool {
-	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
+	return e.ErrorCode == 14 && e.RedirectURI != "" && e.SessionToken != ""
 }
 
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity ClientIdentity) (string, error) {
 	if manualCaptchaForcedMode() {
 		log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
-		return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
+		return requestManualCaptcha(captchaErr.RedirectURI, 180*time.Second)
 	}
 
 	// Egress decision. The default is whatever captchaTunnelEgress
@@ -152,7 +152,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 	}
 	client := newCaptchaClient(profile)
 
-	powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri, identity)
+	powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectURI, identity)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
@@ -188,7 +188,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 			return "", fmt.Errorf("captchaNotRobot API failed (session terminal): %w", err)
 		}
 		log.Printf("[Captcha] go-solver failed (%v) — escalating to headless MITM solver", err)
-		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectUri, captchaProxyDialer(), identity)
+		token, hErr := solveCaptchaViaProxy(captchaErr.RedirectURI, captchaProxyDialer(), identity)
 		if hErr == nil {
 			log.Printf("[Captcha] Success! Got success_token via headless")
 			return token, nil
@@ -209,8 +209,8 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, identity Cl
 	return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 }
 
-func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string, identity ClientIdentity) (string, int, map[string]interface{}, error) {
-	req, err := fhttp.NewRequest("GET", redirectUri, nil)
+func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectURI string, identity ClientIdentity) (string, int, map[string]interface{}, error) {
+	req, err := fhttp.NewRequest("GET", redirectURI, nil)
 	if err != nil {
 		return "", 0, nil, err
 	}
