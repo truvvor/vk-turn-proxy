@@ -295,43 +295,44 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	}
 	code := int(codeFloat)
 
-	// Extract redirect_uri
-	RedirectURI, ok := errData["redirect_uri"].(string)
-	if !ok {
-		log.Printf("missing redirect_uri in captcha error data")
-		return nil
-	}
+	// Everything below error_code is best-effort. VK has TWO shapes for
+	// error_code 14 and only the older one carries captcha_sid/captcha_img:
+	//
+	//   legacy image captcha : captcha_sid + captcha_img (+ redirect_uri)
+	//   not_robot web-challenge:
+	//       error_msg "Captcha need", is_enabled_captcha: true,
+	//       redirect_uri https://id.vk.ru/not_robot_captcha?...session_token=...
+	//       — NO captcha_sid, NO captcha_img
+	//
+	// This function used to `return nil` the moment captcha_sid (or
+	// captcha_img) was absent, which made every not_robot challenge look
+	// like "not a captcha error" and surface as `missing captcha_sid`. The
+	// client then burned through every client_id and gave up with "failed
+	// to get TURN credentials" — while the response in hand had a perfectly
+	// usable redirect_uri.
+	//
+	// The struct and the solver were always ready for it: IsCaptchaError()
+	// keys on RedirectURI + SessionToken, and solveVkCaptcha needs only
+	// those two. The parser was the sole thing refusing to build the value.
+	// So extract optional fields best-effort and let IsCaptchaError() do
+	// the gating — matching how captcha-service's copy of this parser
+	// already behaves.
+	redirectURI, _ := errData["redirect_uri"].(string)
+	errorMsg, _ := errData["error_msg"].(string)
+	captchaImg, _ := errData["captcha_img"].(string)
 
-	// Extract captcha_sid
-	captchaSid, ok := errData["captcha_sid"].(string)
-	if !ok {
-		// try numeric
-		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
+	captchaSid, _ := errData["captcha_sid"].(string)
+	if captchaSid == "" {
+		// VK sends the sid as a JSON number on some responses.
+		if sidNum, ok := errData["captcha_sid"].(float64); ok {
 			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
 		}
-	}
-
-	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
-	}
-
-	// Extract error_msg
-	errorMsg, ok := errData["error_msg"].(string)
-	if !ok {
-		log.Printf("missing error_msg in captcha error data")
-		return nil
 	}
 
 	// Extract session token if redirect_uri present
 	var sessionToken string
-	if RedirectURI != "" {
-		if parsed, err := neturl.Parse(RedirectURI); err == nil {
+	if redirectURI != "" {
+		if parsed, err := neturl.Parse(redirectURI); err == nil {
 			sessionToken = parsed.Query().Get("session_token")
 		} else {
 			log.Printf("failed to parse redirect_uri: %v", err)
@@ -367,7 +368,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		ErrorMsg:                errorMsg,
 		CaptchaSid:              captchaSid,
 		CaptchaImg:              captchaImg,
-		RedirectURI:             RedirectURI,
+		RedirectURI:             redirectURI,
 		IsSoundCaptchaAvailable: isSound,
 		SessionToken:            sessionToken,
 		CaptchaTs:               captchaTs,
