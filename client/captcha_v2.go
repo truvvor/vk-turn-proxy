@@ -309,7 +309,7 @@ func (s *captchaV2Session) fetchDebugInfo(scriptURL string) (string, error) {
 	}
 	body, err := s.doRaw(fhttp.MethodGet, scriptURL, nil, map[string]string{
 		"Accept":  "text/javascript,*/*",
-		"Referer": "https://id.vk.com/",
+		"Referer": "https://" + vkHost("id.vk.com") + "/",
 	})
 	if err != nil {
 		return "", err
@@ -403,10 +403,10 @@ func parseCaptchaV2Page(html string) (*captchaV2Page, error) {
 }
 
 func (s *captchaV2Session) captchaRequest(method string, form [][2]string) (map[string]any, error) {
-	endpoint := "https://api.vk.ru/method/" + method + "?v=" + captchaV2APIVersion
+	endpoint := "https://" + vkHost("api.vk.ru") + "/method/" + method + "?v=" + captchaV2APIVersion
 	body, err := s.doRaw(fhttp.MethodPost, endpoint, form, map[string]string{
-		"Origin":   "https://id.vk.com",
-		"Referer":  "https://id.vk.com/",
+		"Origin":   "https://" + vkHost("id.vk.com"),
+		"Referer":  "https://" + vkHost("id.vk.com") + "/",
 		"Priority": "u=1, i",
 	})
 	if err != nil {

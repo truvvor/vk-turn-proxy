@@ -742,9 +742,9 @@ func resolveCaptchaImageURL(captchaImg string, redirectURI string) string {
 		}
 	}
 	if strings.HasPrefix(trimmed, "/") {
-		return "https://api.vk.ru" + trimmed
+		return "https://" + vkHost("api.vk.ru") + trimmed
 	}
-	return "https://api.vk.ru/" + strings.TrimPrefix(trimmed, "/")
+	return "https://" + vkHost("api.vk.ru") + "/" + strings.TrimPrefix(trimmed, "/")
 }
 
 func captchaInjectedEnhancements() string {
