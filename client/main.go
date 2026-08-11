@@ -810,6 +810,21 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 }
 
 func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, string, error) {
+	// Captcha-free path first. VK gates anon flows per
+	// (FQDN, method, client_id) and the VK Calls tuple is ungated, so this
+	// returns credentials without VK ever issuing a challenge — nothing to
+	// auto-solve, nothing to hand to a human. On any failure we fall
+	// through to the legacy chain below, which keeps the solvers as the
+	// safety net for when VK gates this path too. See creds_vkcalls.go.
+	if vkCallsBypassEnabled {
+		user, pass, addrs, lifetime, err := getCredsViaVKCalls(ctx, link, streamID)
+		if err == nil && len(addrs) > 0 {
+			log.Printf("[STREAM %d] [VK Calls] captcha-free credentials obtained (lifetime=%v)", streamID, lifetime)
+			return user, pass, addrs[0], nil
+		}
+		log.Printf("[STREAM %d] [VK Calls] bypass failed, falling back to legacy captcha chain: %v", streamID, err)
+	}
+
 	profile := Profile{
 		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
@@ -957,7 +972,15 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					}
 				case captchaSolveModeManual:
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
-					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
+					// Budget for a HUMAN, not for code. 60 s was hostile:
+					// by the time you notice the prompt, open the page on a
+					// phone and solve VK's challenge, the context is gone
+					// and the client restarts with a fresh token — so the
+					// page you were looking at is already dead. Headless
+					// mode needs far less, but it bails out on its own the
+					// moment Chromium reports a terminal status, so the
+					// larger budget costs it nothing.
+					manualCtx, manualCancel := context.WithTimeout(ctx, manualCaptchaTimeout)
 
 					type manualRes struct {
 						token string
@@ -1813,7 +1836,29 @@ func main() {
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+	headlessCaptchaFlag := flag.Bool("headless-captcha", false, "solve the manual-captcha page with headless Chromium instead of opening a browser")
+	chromiumPathFlag := flag.String("chromium", "", "path to chrome-headless-shell/chromium for -headless-captcha (auto-detected if empty)")
+	headlessUAFlag := flag.String("headless-ua", "", "override navigator.userAgent in the headless browser (empty = Chromium's own)")
+	manualTimeoutFlag := flag.Duration("manual-captcha-timeout", 5*time.Minute, "how long to wait for a captcha solve before giving up and restarting with a fresh token")
+	noBypassFlag := flag.Bool("no-vkcalls-bypass", false, "disable the captcha-free VK Calls path (api.vk.me) and always use the legacy captcha chain")
 	flag.Parse()
+
+	// Captcha configuration. The VK Calls bypass is on by default because
+	// it is the only path that currently avoids a captcha entirely; the
+	// flag exists to exercise the legacy chain deliberately.
+	vkCallsBypassEnabled = !*noBypassFlag
+	headlessCaptchaEnabled = *headlessCaptchaFlag
+	chromiumPathOverride = *chromiumPathFlag
+	headlessUserAgent = *headlessUAFlag
+	if *manualTimeoutFlag > 0 {
+		manualCaptchaTimeout = *manualTimeoutFlag
+	}
+	if !vkCallsBypassEnabled {
+		log.Printf("[Captcha] VK Calls bypass DISABLED by flag — legacy captcha chain only")
+	}
+	if headlessCaptchaEnabled {
+		log.Printf("[Captcha] headless solving ENABLED (chromium=%q)", chromiumPathOverride)
+	}
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
