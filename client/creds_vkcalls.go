@@ -5,7 +5,7 @@ package main
 //
 // VK Calls uses a different API surface than our legacy bootstrap:
 //
-//   host:       api.vk.me                        (not api.vk.com / api.vk.ru)
+//   host:       api.vk.{com,me}  (-vk-zone)      (not our legacy api host)
 //   client_id:  8093730  (VK Connect)            (not our vkCreds client_ids)
 //   auth ep:    /method/auth.getAnonymToken      (not login.vk.com get_anonym_token)
 //   param:      anonymous_token=                 (not access_token=)
@@ -39,9 +39,6 @@ const (
 	// app_id:8093730 claim that passes messages.getAnonymCallToken without a
 	// captcha gate.
 	vkConnectClientID = "8093730"
-	// vkCallsAPIHost is the FQDN VK Calls uses. Same backend as api.vk.com but
-	// VK gates per FQDN, so the captcha rules differ.
-	vkCallsAPIHost = "api.vk.me"
 	// vkCallsAPIVersion matches what VK Calls iOS sends.
 	vkCallsAPIVersion = "5.276"
 )
@@ -100,7 +97,7 @@ func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, str
 	// Step 1: auth.getAnonymToken -> anonymous_token JWT.
 	step1URL := fmt.Sprintf(
 		"https://%s/method/auth.getAnonymToken?v=%s&client_id=%s&link=%s&device_id=%s&anonymName=%s&lang=en",
-		vkCallsAPIHost, vkCallsAPIVersion, vkConnectClientID, linkURL, deviceID, nameEnc,
+		vkAPIHost(), vkCallsAPIVersion, vkConnectClientID, linkURL, deviceID, nameEnc,
 	)
 	resp1, err := doRequest(step1URL)
 	if err != nil {
@@ -116,7 +113,7 @@ func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, str
 	// Step 2: messages.getCallPreview -> user_id + secret.
 	step2URL := fmt.Sprintf(
 		"https://%s/method/messages.getCallPreview?v=%s&anonymous_token=%s&device_id=%s&extended=1&fields=first_name,last_name,photo_200&lang=en&link=%s",
-		vkCallsAPIHost, vkCallsAPIVersion, anonymTokenEnc, deviceID, linkURL,
+		vkAPIHost(), vkCallsAPIVersion, anonymTokenEnc, deviceID, linkURL,
 	)
 	resp2, err := doRequest(step2URL)
 	if err != nil {
@@ -140,7 +137,7 @@ func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, str
 	// VK captcha-gated on the legacy path; VK Connect passes it captcha-free.
 	step3URL := fmt.Sprintf(
 		"https://%s/method/messages.getAnonymCallToken?v=%s&anonymous_token=%s&device_id=%s&link=%s&name=%s&user_id=%s&secret=%s&lang=en",
-		vkCallsAPIHost, vkCallsAPIVersion, anonymTokenEnc, deviceID, linkURL,
+		vkAPIHost(), vkCallsAPIVersion, anonymTokenEnc, deviceID, linkURL,
 		nameEnc, userIDStr, neturl.QueryEscape(secret),
 	)
 	resp3, err := doRequest(step3URL)
@@ -159,7 +156,7 @@ func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, str
 	// Step 4: OK auth.anonymLogin -> session_key. Same OK endpoint and shape as
 	// the legacy flow.
 	okDeviceID := uuid.New().String()
-	step4URL := "https://calls.okcdn.ru/fb.do?session_data=" +
+	step4URL := "https://" + okCallsHost() + "/fb.do?session_data=" +
 		neturl.QueryEscape(fmt.Sprintf(
 			`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`, okDeviceID,
 		)) +
@@ -176,7 +173,7 @@ func getVkCredsViaVKCalls(link string, resolver *protectedResolver) (string, str
 
 	// Step 5: vchat.joinConversationByLink -> TURN credentials.
 	step5URL := fmt.Sprintf(
-		"https://calls.okcdn.ru/fb.do?joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s",
+		"https://"+okCallsHost()+"/fb.do?joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s",
 		link, okAnonymToken, sessionKey,
 	)
 	resp5, err := doRequest(step5URL)

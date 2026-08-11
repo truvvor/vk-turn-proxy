@@ -97,7 +97,7 @@ func (s *captchaNotRobotSession) baseValues() neturl.Values {
 }
 
 func (s *captchaNotRobotSession) request(method string, values neturl.Values) (map[string]interface{}, error) {
-	reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+	reqURL := "https://" + vkHost("api.vk.ru") + "/method/" + method + "?v=5.131"
 	req, err := fhttp.NewRequestWithContext(s.ctx, "POST", reqURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, err

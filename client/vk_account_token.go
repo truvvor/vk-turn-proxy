@@ -24,11 +24,18 @@ import (
 // WebView.
 const (
 	okCallsAppKey   = "CGMMEJLGDIHBABABA"
-	okCallsFbDo     = "https://calls.okcdn.ru/fb.do"
-	vkExecuteURL    = "https://api.vk.com/method/execute?v=5.282&client_id=6287487"
-	vkWebTokenURL   = "https://login.vk.com/?act=web_token"
 	vkWebTokenAppID = "6287487"
 )
+
+// These three endpoints are functions rather than consts because -vk-zone
+// picks their hostname at runtime; see vk_zone.go. okCallsFbDo is on
+// Odnoklassniki infrastructure and has no .com spelling, so it is unaffected
+// by the zone and only routed through okCallsHost for consistency.
+func okCallsFbDo() string { return "https://" + okCallsHost() + "/fb.do" }
+func vkExecuteURL() string {
+	return "https://" + vkHost("api.vk.com") + "/method/execute?v=5.282&client_id=6287487"
+}
+func vkWebTokenURL() string { return "https://" + vkHost("login.vk.com") + "/?act=web_token" }
 
 var (
 	vkSessionMu     sync.RWMutex
@@ -406,7 +413,7 @@ func getAccountVkCreds(ctx context.Context, link string, resolver *protectedReso
 		form := url.Values{}
 		form.Set("version", "1")
 		form.Set("app_id", vkWebTokenAppID)
-		resp, mintErr := post(vkWebTokenURL, form, map[string]string{"Cookie": cookies, "User-Agent": ua})
+		resp, mintErr := post(vkWebTokenURL(), form, map[string]string{"Cookie": cookies, "User-Agent": ua})
 		if mintErr != nil {
 			return "", "", nil, 0, fmt.Errorf("web_token mint: %w", mintErr)
 		}
@@ -429,7 +436,7 @@ func getAccountVkCreds(ctx context.Context, link string, resolver *protectedReso
 		form := url.Values{}
 		form.Set("code", `return API.messages.getCallToken({"env":"production"});`)
 		form.Set("access_token", privilegedToken)
-		resp, callErr := post(vkExecuteURL, form, nil)
+		resp, callErr := post(vkExecuteURL(), form, nil)
 		if callErr != nil {
 			return "", "", nil, 0, fmt.Errorf("getCallToken: %w", callErr)
 		}
@@ -463,7 +470,7 @@ func getAccountVkCreds(ctx context.Context, link string, resolver *protectedReso
 		form.Set("method", "auth.anonymLogin")
 		form.Set("format", "JSON")
 		form.Set("application_key", okCallsAppKey)
-		resp, loginErr := post(okCallsFbDo, form, nil)
+		resp, loginErr := post(okCallsFbDo(), form, nil)
 		if loginErr != nil {
 			return "", "", nil, 0, fmt.Errorf("anonymLogin: %w", loginErr)
 		}
@@ -485,7 +492,7 @@ func getAccountVkCreds(ctx context.Context, link string, resolver *protectedReso
 	form.Set("format", "JSON")
 	form.Set("application_key", okCallsAppKey)
 	form.Set("session_key", okSessionKey)
-	resp, joinErr := post(okCallsFbDo, form, nil)
+	resp, joinErr := post(okCallsFbDo(), form, nil)
 	if joinErr != nil {
 		return "", "", nil, 0, fmt.Errorf("vchat join: %w", joinErr)
 	}

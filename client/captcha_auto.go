@@ -174,7 +174,7 @@ func callCaptchaNotRobot(
 	profile Profile,
 ) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
-		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+		reqURL := "https://" + vkHost("api.vk.ru") + "/method/" + method + "?v=5.131"
 		parsedURL, err := neturl.Parse(reqURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse request URL: %w", err)
@@ -189,8 +189,8 @@ func callCaptchaNotRobot(
 		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://id.vk.ru")
-		req.Header.Set("Referer", "https://id.vk.ru/")
+		req.Header.Set("Origin", "https://"+vkHost("id.vk.ru"))
+		req.Header.Set("Referer", "https://"+vkHost("id.vk.ru")+"/")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")

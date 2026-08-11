@@ -645,7 +645,7 @@ func getVkCredsWithFallback(link string, resolver *protectedResolver, allowInter
 
 	vkDelayRandom(100, 150)
 	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
-	url = "https://calls.okcdn.ru/fb.do"
+	url = "https://" + okCallsHost() + "/fb.do"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
@@ -656,7 +656,7 @@ func getVkCredsWithFallback(link string, resolver *protectedResolver, allowInter
 
 	vkDelayRandom(100, 150)
 	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token2, token3)
-	url = "https://calls.okcdn.ru/fb.do"
+	url = "https://" + okCallsHost() + "/fb.do"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
@@ -2289,6 +2289,7 @@ func main() { //nolint:cyclop
 	log.Printf("[DNS] mode=%s", dnsMode())
 	setBrowserFamily(opts.browserFP)
 	log.Printf("[FP] browser=%s", browserFamily)
+	log.Printf("[VK] zone=%s api=%s ok=%s", vkZone, vkAPIHost(), okCallsHost())
 
 	if opts.roomExchangeMode {
 		if err := runRoomExchangeMode(opts); err != nil {
