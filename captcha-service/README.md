@@ -61,9 +61,51 @@ Successful response (typical 2-10 s):
   "user": "1715792025:guest",
   "pass": "abc123…",
   "addr": "95.163.34.151:3478",
+  "addrs": ["95.163.34.151:3478", "95.163.34.152:3478"],
   "expires_at": "2026-05-15T07:45:00Z"
 }
 ```
+
+`addrs` carries every relay VK offered; `addr` is `addrs[0]`, kept for
+wire-compat with clients that predate the field. Clients should rotate
+through `addrs` when a dial fails rather than discarding the whole
+credential — one dead relay doesn't mean the credential is bad.
+
+`expires_at` is derived from the `lifetime`/`ttl` VK reports on the
+credential, falling back to 45 s when VK omits it.
+
+The request body also accepts optional `user_agent` and `cookies`, which
+are forwarded to VK on every call so the solve and the subsequent
+credential redemption share one browser identity:
+
+```json
+{
+  "link": "<vk-call-join-link>",
+  "user_agent": "Mozilla/5.0 (iPhone; …) Safari/604.1",
+  "cookies": [{"name": "remixsid", "value": "…", "domain": ".vk.com"}]
+}
+```
+
+### Credential paths
+
+`getCreds` tries two paths in order:
+
+1. **VK Calls (captcha-free)** — `api.vk.me` + VK Connect's public
+   `client_id=8093730`, via `auth.getAnonymToken` →
+   `messages.getCallPreview` → `messages.getAnonymCallToken`. VK gates
+   anon flows per `(FQDN, method, client_id)` tuple and this one is
+   ungated, so no captcha is ever issued. Ported from the
+   [WINGS-N fork](https://github.com/WINGS-N/vk-turn-proxy). See
+   `creds_vkcalls.go`.
+2. **Legacy (captcha-gated)** — `login.vk.com` +
+   `api.vk.com/method/calls.getAnonymousToken`. VK captcha-gated this
+   method in mid-2026, so it routes through the v2 solver and the
+   headless-Chromium escalation. Kept as the fallback for when VK
+   eventually gates path 1 too.
+
+`/stats` reports `creds_via_bypass` / `creds_via_legacy` so you can see
+which path is actually carrying traffic. Set `VKCALLS_BYPASS=0` to force
+path 2 (useful for exercising the solvers after a change).
 
 Error responses:
 - `400` — missing/invalid `link`.
@@ -82,6 +124,7 @@ Error responses:
 | `LISTEN_ADDR` | `:8080` | bind address |
 | `API_KEY` | *(required)* | bearer token clients must send |
 | `CAPTCHA_TRAP_DIR` | `./trap` | where to write debug artefacts for failed solves (slider images, etc.) |
+| `VKCALLS_BYPASS` | `1` | `0`/`false` disables the captcha-free VK Calls path and forces the legacy captcha-solving flow |
 | `WARP_INTERFACE` | *(unset)* | name of a pre-existing WireGuard interface (typically Cloudflare WARP) to pin VK-bound HTTP sockets to. See **WARP egress** below |
 
 ## WARP egress

@@ -31,11 +31,21 @@ import (
 )
 
 type credResponse struct {
-	User      string    `json:"user"`
-	Pass      string    `json:"pass"`
+	User string `json:"user"`
+	Pass string `json:"pass"`
+	// Addr is the first TURN address, kept for wire-compat with clients
+	// predating the Addrs field. New clients should read Addrs and rotate
+	// through it on dial failure rather than writing off the whole
+	// credential when one relay is unreachable.
 	Addr      string    `json:"addr"`
+	Addrs     []string  `json:"addrs,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
+
+// defaultCredLifetime is the fallback expiry when VK doesn't report a
+// lifetime/ttl on turn_server. VK rotates roughly every 50 s; 45 s is the
+// safe usable window.
+const defaultCredLifetime = 45 * time.Second
 
 type errorResponse struct {
 	Error string `json:"error"`
@@ -94,6 +104,16 @@ func main() {
 	if p := os.Getenv("CHROMIUM_PATH"); p != "" {
 		chromiumPathOverride = p
 		log.Printf("captcha: chromium override CHROMIUM_PATH=%q", p)
+	}
+
+	// VK Calls captcha-free path (creds_vkcalls.go). On by default; set
+	// VKCALLS_BYPASS=0 to force the legacy captcha-solving flow, e.g. to
+	// exercise the solvers after a change.
+	if v := os.Getenv("VKCALLS_BYPASS"); v == "0" || v == "false" {
+		vkCallsBypassEnabled = false
+		log.Printf("creds: VK Calls bypass DISABLED (VKCALLS_BYPASS=%q) — legacy captcha flow only", v)
+	} else {
+		log.Printf("creds: VK Calls bypass ENABLED (api.vk.me + VK Connect, captcha-free); legacy flow is the fallback")
 	}
 
 	mux := http.NewServeMux()
@@ -297,7 +317,7 @@ func solveLocally(ctx context.Context, link string, identity ClientIdentity) (*c
 	}
 	defer func() { <-solveSlot }()
 
-	user, pass, addr, err := getCreds(ctx, link, identity)
+	user, pass, addrs, lifetime, err := getCreds(ctx, link, identity)
 	if err != nil {
 		// directSaturated() flips during the captcha pipeline when
 		// VK returns ERROR_LIMIT — re-check after so the caller can
@@ -305,12 +325,16 @@ func solveLocally(ctx context.Context, link string, identity ClientIdentity) (*c
 		// tripped the limit.
 		return nil, directSaturated(), err
 	}
+	if lifetime <= 0 {
+		lifetime = defaultCredLifetime
+	}
 
 	return &credResponse{
 		User:      user,
 		Pass:      pass,
-		Addr:      addr,
-		ExpiresAt: time.Now().Add(45 * time.Second), // VK rotates ~50 s; 45 s is the safe usable window.
+		Addr:      addrs[0],
+		Addrs:     addrs,
+		ExpiresAt: time.Now().Add(lifetime),
 	}, directSaturated(), nil
 }
 
@@ -358,6 +382,9 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds int64      `json:"uptime_seconds"`
 		WARP          string     `json:"warp"`
 		Egress        []string   `json:"egress_pool"`
+		BypassEnabled bool       `json:"vkcalls_bypass_enabled"`
+		CredsBypass   int64      `json:"creds_via_bypass"`
+		CredsLegacy   int64      `json:"creds_via_legacy"`
 		Peers         []peerStat `json:"peers"`
 	}{
 		Attempts:      stats.attempts,
@@ -370,6 +397,9 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(time.Since(startedAt).Seconds()),
 		WARP:          warpStatus(),
 		Egress:        egressPoolSnapshot(),
+		BypassEnabled: vkCallsBypassEnabled,
+		CredsBypass:   credsViaBypass.Load(),
+		CredsLegacy:   credsViaLegacy.Load(),
 		Peers:         peerStats,
 	}
 	stats.mu.Unlock()
