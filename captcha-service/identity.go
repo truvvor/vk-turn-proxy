@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	mathrand "math/rand"
 	"os"
 	"strings"
@@ -9,8 +10,9 @@ import (
 	tlsprofiles "github.com/bogdanfinn/tls-client/profiles"
 )
 
-// Browser family identifiers for the fingerprint selector. "auto" (the
-// default) picks a random profile across every family. Ported from the
+// Browser family identifiers for the fingerprint selector. "auto" picks a
+// random profile across every family; it is an explicit opt-in, not the
+// default (see browserFamily). Ported from the
 // WINGS-N fork, which pairs each User-Agent with its matching uTLS
 // ClientHello so the HTTP and TLS fingerprints can't contradict each other.
 const (
@@ -60,14 +62,9 @@ var lastNames = []string{
 // Edge) emit sec-ch-ua* Client Hints; Safari and Firefox never send them, so
 // those entries leave SecChUa empty and the apply helpers omit the headers.
 //
-// Before this table the whole fleet presented exactly ONE TLS fingerprint
-// (Safari_IOS_18_0) on every request from every node — a trivially clusterable
-// signal. The families come from the WINGS-N fork, whose captcha-free VK Calls
-// path runs against this same mix in production.
-//
-// iPhone Safari stays first-among-equals for the legacy captcha path: real
-// users clicking a VK call link from Safari on iPhone aren't asked for a
-// captcha, and that's the request we most want to look like.
+// Only the iOS Safari entries are used by default; the other families are
+// reachable through BROWSER_FP for deliberate experiments. See browserFamily
+// for why the default is not "randomise across everything".
 var profiles = []Profile{
 	// iOS Safari — exact UA/uTLS pairing.
 	{
@@ -94,14 +91,10 @@ var profiles = []Profile{
 		AcceptLanguage: "en-US,en;q=0.9",
 		TLS:            tlsprofiles.Safari_IOS_17_0,
 	},
-	// macOS Safari. Safari's ClientHello is stable across major versions, so
-	// the current UA pairs with the closest available desktop uTLS profile.
-	{
-		Family:         FamilySafari,
-		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
-		AcceptLanguage: "en-US,en;q=0.9",
-		TLS:            tlsprofiles.Safari_16_0,
-	},
+	// NOTE: no desktop Safari here on purpose. The Safari family is the
+	// default (see browserFamily), and what earns that default is the
+	// iPhone shape specifically — a macOS Safari entry would dilute it
+	// with a desktop fingerprint for no benefit.
 
 	// Windows Chrome
 	{
@@ -159,21 +152,48 @@ var profiles = []Profile{
 	},
 }
 
-// browserFamily restricts profile selection to one engine family. Set once at
-// startup from BROWSER_FP; empty / "auto" means random across all families.
-var browserFamily = FamilyAuto
+// browserFamily restricts profile selection to one engine family, set once at
+// startup from BROWSER_FP. It defaults to Safari — specifically iPhone Safari — and NOT to
+// auto. This is a correction of my own change in #41.
+//
+// #41 added Chrome/Edge/Firefox profiles and let selection randomise across
+// all of them, on the theory that one TLS fingerprint across the fleet is a
+// clusterable signal. That theory was speculative. The constraint it
+// overrode was not: the upstream identity table was deliberately iPhone
+// Safari ONLY, because VK's anti-bot pipeline does not challenge requests
+// shaped like a real user opening a call link in Safari on an iPhone — and
+// it does challenge everything else. Diversity across shapes that all get
+// captcha'd is strictly worse than uniformity on the shape that doesn't.
+//
+// Field evidence: with the mixed pool, the VK Calls path passed steps 1-3
+// captcha-free and then got not_robot on the final join. ~55% of requests
+// were going out desktop-shaped.
+//
+// The paired-TLS machinery from #41 is kept — a Safari UA over a Chrome
+// ClientHello is its own tell, and pairing them is right regardless. The
+// other families stay reachable through BROWSER_FP for deliberate
+// experiments; they are simply no longer the default.
+var browserFamily = FamilySafari
 
-// initBrowserFamily reads BROWSER_FP. Unknown values fall back to auto rather
-// than failing the boot — a typo shouldn't take the node down.
+// initBrowserFamily reads BROWSER_FP.
+//
+// Unset (the normal case) means iPhone Safari, which is the shape VK doesn't
+// challenge — see the browserFamily comment. "auto" is an explicit opt-in to
+// randomising across every family, not a default: it is worth having for
+// experiments, but it costs captcha pass-rate and should be a decision, not
+// something you get by leaving an env var unset.
+//
+// A typo falls back to the safe default rather than failing the boot.
 func initBrowserFamily() {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("BROWSER_FP")))
 	switch raw {
-	case FamilyChrome, FamilyEdge, FamilySafari, FamilyFirefox:
+	case FamilyChrome, FamilyEdge, FamilySafari, FamilyFirefox, FamilyAuto:
 		browserFamily = raw
-	case "", FamilyAuto:
-		browserFamily = FamilyAuto
+	case "":
+		browserFamily = FamilySafari
 	default:
-		browserFamily = FamilyAuto
+		log.Printf("identity: unknown BROWSER_FP=%q — falling back to %s", raw, FamilySafari)
+		browserFamily = FamilySafari
 	}
 }
 

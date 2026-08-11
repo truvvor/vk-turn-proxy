@@ -55,7 +55,6 @@ import (
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
-	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/google/uuid"
 )
 
@@ -81,7 +80,11 @@ var vkCallsBypassEnabled = true
 // including an unexpected captcha gate — tells the caller to fall back to the
 // legacy captcha-solving chain.
 func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string, string, []string, time.Duration, error) {
-	profile := getRandomProfile()
+	// iPhone Safari, NOT a random desktop profile. api.vk.me is the private
+	// API of VK's iOS Calls app; a desktop Chrome identity there is exactly
+	// the mismatch VK's anti-bot pipeline challenges. See
+	// client/profiles.go::iosSafariProfiles.
+	profile := getIOSSafariProfile()
 	name := generateName()
 	deviceID := uuid.New().String()
 	linkURL := neturl.QueryEscape("https://vk.com/call/join/" + link)
@@ -89,7 +92,7 @@ func getCredsViaVKCalls(ctx context.Context, link string, streamID int) (string,
 
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(20),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithClientProfile(profile.TLS),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 		tlsclient.WithDialer(getCustomNetDialer()),
 	)
