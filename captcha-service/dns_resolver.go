@@ -90,6 +90,26 @@ var fallbackIPs = map[string][]string{
 	"api.vk.ru":   {"87.240.137.158", "87.240.190.78"},
 	"id.vk.ru":    {"87.240.137.158", "87.240.190.78"},
 	"vk.ru":       {"87.240.137.158"},
+
+	// Hosts used by the VK Calls captcha-free path (creds_vkcalls.go).
+	// api.vk.me resolves to the SAME address pool as api.vk.com — same
+	// backend, different FQDN, which is exactly why VK's per-(FQDN, method,
+	// client_id) gating can treat them differently. calls.okcdn.ru serves
+	// steps 4-5 and is used by BOTH the bypass and legacy paths; it was
+	// missing from this map entirely, so a DoH outage would have taken out
+	// credential fetch on every path, not just the new one.
+	//
+	// Provenance: resolved 2026-08-11 from a EU/US vantage point. VK uses
+	// geo-DNS, so a node in another region may legitimately see different
+	// addresses — re-derive with `getent ahostsv4 <host>` ON THE NODE if
+	// this layer ever actually fires. It is layer 3 of 3 (system resolver
+	// → DoH → this), so on a healthy VPS it should stay cold.
+	"api.vk.me": {
+		"87.240.129.140", "87.240.137.130", "87.240.190.70", "93.186.225.205",
+	},
+	"calls.okcdn.ru": {
+		"155.212.204.12", "155.212.204.136", "155.212.204.195",
+	},
 }
 
 // customDial is the net.Dialer.DialContext-shaped function plug into
